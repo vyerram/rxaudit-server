@@ -1,0 +1,57 @@
+__pycache__
+.vscode
+.vscode/
+.env
+.git
+.gitattributes
+.gitignore
+*.log
+*.md
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.manifest
+*.spec
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+
+launch.json
+
+# Flask stuff:
+instance/
+.webassets-cache
+
+# Scrapy stuff:
+.scrapy
+
+# Sphinx documentation
+docs/_build/
+
+# PyBuilder
+.pybuilder/
+target/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+.env.example
+.env
+.venv
+*/.venv
+.venv/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+launch.json
+
+node_modules
+*/node_modules
