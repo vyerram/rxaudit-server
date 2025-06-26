@@ -1,8 +1,8 @@
 version: '3.8'
 services:
   web:
-    container_name: rxaudit-prod-ec2-backend-ecr
-    image: public.ecr.aws/i5b2u7r3/rxaudit-prod-ec2-backend-ecr:latest
+    container_name: rxaudit-dev-ec2-backend-ecr
+    image: public.ecr.aws/i5b2u7r3/rxaudit-dev-ec2-backend-ecr:latest
     command: bash -c "./entrypoint.prod.sh && gunicorn core.wsgi:application --bind 0.0.0.0:8000"
     volumes:
       - .:/usr/src/app/
