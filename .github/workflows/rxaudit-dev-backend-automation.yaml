@@ -1,0 +1,57 @@
+name: rxaudit-dev-backend-automation
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+  # connect-ec2:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Step 1: Checkout Repository
+      - name: Checkout Repository
+        uses: actions/checkout@v2
+        with:
+          ref: develop
+          
+      - name: Set up AWS CLI
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+            aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+            aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+            aws-region: ${{ secrets.AWS_SERVER_REGION }}
+
+      - name: Log in to rxaudit-dev-backend of Amazon ECR Public
+        id: login-ecr
+        run: |
+          aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws/i5b2u7r3
+
+      - name: Build and Push the rxaudit-dev-backend Docker image for arm64
+        run: |
+          docker buildx create --use
+          docker buildx build --no-cache --platform linux/arm64 -t public.ecr.aws/i5b2u7r3/rxaudit-dev-ec2-backend-ecr:latest --push .
+  
+      # Step 2: Decode SSH Key
+      - name: Decode SSH Key
+        run: |
+          echo "$SSH_KEY_BASE64" | base64 -d > allwin_testsite_east1_KP.pem
+          chmod 600 allwin_testsite_east1_KP.pem
+        env:
+          SSH_KEY_BASE64: ${{ secrets.SSH_KEY_BASE64 }}
+          
+      # Step 3: Start SSH Agent and Add Key
+      - name: Start SSH Agent and Add Key
+        run: |
+          eval "$(ssh-agent -s)"
+          ssh-add allwin_testsite_east1_KP.pem
+          ssh-add -l
+          ssh -o ForwardAgent=yes -o StrictHostKeyChecking=no -v -A -i allwin_testsite_east1_KP.pem ec2-user@ec2-52-23-179-232.compute-1.amazonaws.com << EOF
+            df -h
+            ssh ec2-user@10.0.0.41 /bin/bash
+            df -h
+              cd auditrx/
+              docker-compose down
+              docker rmi rxaudit-dev-ec2-backend-ecr
+              docker pull public.ecr.aws/i5b2u7r3/rxaudit-dev-ec2-backend-ecr:latest
+              docker-compose up -d
