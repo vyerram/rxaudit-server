@@ -23,8 +23,8 @@ Before setting up the project, make sure you have the following installed on you
 ### 1. :🔁 Clone the Repository
 Use git to download the project:
 ```bash
-git clone https://github.com/allwinrx/rxaudit-dev-backend.git
-cd rxaudit-dev-backend
+git clone https://github.com/allwinrx/rxaudit-server.git
+cd rxaudit-server
 ```
 ### 2. 🛠️ Create and Activate Virtual Environment 
 A virtual environment keeps dependencies isolated from your system Python.
