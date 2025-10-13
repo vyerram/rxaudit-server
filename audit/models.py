@@ -68,6 +68,9 @@ class ProcessLogHdr(CoreModel):
     bin_number = models.CharField(
         db_column="plg_bin_number", blank=True, null=True, max_length=128
     )
+    processed_count = models.IntegerField(db_column="plg_processed_count", blank=True, null=True)
+    failed_count = models.IntegerField(db_column="plg_failed_count", blank=True, null=True)
+    failed_files_json = models.JSONField(db_column="plg_failed_files", blank=True, null=True)
 
     class Meta:
         db_table = "OPT_PLG_ProcessLogHdr"
