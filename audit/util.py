@@ -1125,38 +1125,40 @@ def handle_zip_file(file, process_log, obj, pharmacy, is_reprocess=False):
         process_log.failed_files_json = "[]"
         process_log.failed_count = 0
         process_log.processed_count = 0
-        process_log.save(update_fields=["failed_files_json", "failed_count", "processed_count"])
+        # NEW: reset detailed category counts
+        process_log.pharmacy_processed_count = 0
+        process_log.pharmacy_failed_count = 0
+        process_log.distributor_processed_count = 0
+        process_log.distributor_failed_count = 0
+        process_log.save(update_fields=[
+            "failed_files_json",
+            "failed_count",
+            "processed_count",
+            # NEW:
+            "pharmacy_processed_count",
+            "pharmacy_failed_count",
+            "distributor_processed_count",
+            "distributor_failed_count",
+        ])
 
         # --- CLEANUP OLD DATA IF REPROCESS ---
         if is_reprocess:
             print(f"♻️ Starting reprocess for Process ID: {process_log.id}")
-
-            # 1. Mark process header as In Progress
             process_log.status = get_processing_status(ProcessingStatusCodes.Inprogress.value)
             process_log.save(update_fields=["status"])
-
-            # 2. Remove old error logs
             ErrorLogs.objects.filter(process_log=process_log).delete()
-
-            # 3. Parse failed file names from previous run
             failed_list = []
             if process_log.failed_files_json and process_log.failed_files_json != "[]":
                 try:
                     failed_list = json.loads(process_log.failed_files_json)
                 except Exception:
                     failed_list = []
-
-            # 4. Remove ProcessLogDetail + audit files for failed files only
             audit_dir = os.path.join(os.getcwd(), settings.AUDIT_FILES_LOCATION)
             for failed_name in failed_list:
                 possible_names = [failed_name, f"cleaned_{failed_name}"]
-
-                # Delete DB entries for failed files
                 ProcessLogDetail.objects.filter(
                     process_log=process_log, file_name__in=possible_names
                 ).delete()
-
-                # Delete physical files for those failed ones
                 for name in possible_names:
                     fpath = os.path.join(audit_dir, name)
                     if os.path.exists(fpath):
@@ -1181,7 +1183,6 @@ def handle_zip_file(file, process_log, obj, pharmacy, is_reprocess=False):
         # --- EXTRACT FILES ---
         extracted_files = unzip_files(temp_zip_path, extract_to_folder, process_log)
 
-        # --- VALIDATE REQUIRED FILES (ONLY FOR INITIAL RUN) ---
         if not is_reprocess:
             validate_required_files(extracted_files, process_log)
 
@@ -1207,6 +1208,17 @@ def handle_zip_file(file, process_log, obj, pharmacy, is_reprocess=False):
                 clean_file_and_retreive_output_file(base_name, output_file)
             except Exception as e:
                 failed_files.append(original_name)
+                # NEW: increment category failed counts
+                if "pharmacy" in original_name.lower():
+                    process_log.pharmacy_failed_count += 1
+                elif "distributor" in original_name.lower():
+                    process_log.distributor_failed_count += 1
+                process_log.failed_count += 1
+                process_log.save(update_fields=[
+                    "failed_count",
+                    "pharmacy_failed_count",
+                    "distributor_failed_count"
+                ])
                 log_error(
                     process_log=process_log,
                     error_message=f"Error cleaning {original_name}: {e}",
@@ -1244,8 +1256,12 @@ def handle_zip_file(file, process_log, obj, pharmacy, is_reprocess=False):
                                     pk=get_default_value_if_null(distributor, None),
                                 ),
                             )
+                            # NEW: increment distributor processed count
+                            process_log.distributor_processed_count += 1
                     else:
                         failed_files.append(original_name)
+                        # NEW: increment distributor failed count
+                        process_log.distributor_failed_count += 1
                         log_error(
                             process_log=process_log,
                             error_message=f"Distributor '{distributor_name}' not found.",
@@ -1274,6 +1290,8 @@ def handle_zip_file(file, process_log, obj, pharmacy, is_reprocess=False):
                                     Pharmacy, pk=get_default_value_if_null(pharmacy, None)
                                 ),
                             )
+                            # NEW: increment pharmacy processed count
+                            process_log.pharmacy_processed_count += 1
                             # Validate content
                             process_audit_data = ProcessAuditData()
                             process_audit_data.validate_headers(output_file, False, pharmacy)
@@ -1282,6 +1300,8 @@ def handle_zip_file(file, process_log, obj, pharmacy, is_reprocess=False):
                             )
                             if not is_valid_file:
                                 failed_files.append(original_name)
+                                # NEW: increment pharmacy failed count
+                                process_log.pharmacy_failed_count += 1
                                 log_error(
                                     process_log=process_log,
                                     error_message=f"Invalid NDCs {invalid_ndcs} in {original_name}",
@@ -1303,36 +1323,47 @@ def handle_zip_file(file, process_log, obj, pharmacy, is_reprocess=False):
                     except Exception as e:
                         print(f"⚠️ Could not remove failed file {fpath}: {e}")
 
-        # --- TRIGGER FINAL REPORT ---
-        process_audit_data = ProcessAuditData()
-        error_severity = ErrorSeverity.objects.get(code="WA").id
-        if not ErrorLogs.objects.filter(process_log=process_log).exclude(
-            error_severity=error_severity
-        ).exists():
-            process_audit_data.trigger_process(obj)
-            process_log.status = get_processing_status(ProcessingStatusCodes.Success.value)
-        else:
-            process_log.status = get_processing_status(ProcessingStatusCodes.Failure.value)
-
-        # --- UPDATE COUNTS FOR UI ---
+        # --- FINAL REPORT & SAVE COUNTS ---
         total_success = ProcessLogDetail.objects.filter(process_log=process_log).count()
         process_log.failed_files_json = json.dumps(failed_files)
         process_log.failed_count = len(failed_files)
         process_log.processed_count = total_success
-        process_log.save(
-            update_fields=["processed_count", "failed_count", "failed_files_json", "status"]
-        )
+        if len(failed_files) == 0:
+            process_log.status = get_processing_status(ProcessingStatusCodes.Success.value)
+        else:
+             process_log.status = get_processing_status(ProcessingStatusCodes.Failure.value)
+             
+        process_log.save(update_fields=[
+            "processed_count",
+            "failed_count",
+            "failed_files_json",
+            "status",
+            # NEW:
+            "pharmacy_processed_count",
+            "pharmacy_failed_count",
+            "distributor_processed_count",
+            "distributor_failed_count",
+        ])
+        
+
 
     except Exception as e:
-        # --- HANDLE EXCEPTION SAFELY ---
         total_success = ProcessLogDetail.objects.filter(process_log=process_log).count()
         process_log.status = get_processing_status(ProcessingStatusCodes.Failure.value)
         process_log.failed_files_json = json.dumps(failed_files)
         process_log.failed_count = len(failed_files)
         process_log.processed_count = total_success
-        process_log.save(
-            update_fields=["status", "processed_count", "failed_files_json", "failed_count"]
-        )
+        # NEW: preserve last known detailed counts
+        process_log.save(update_fields=[
+            "status",
+            "processed_count",
+            "failed_files_json",
+            "failed_count",
+            "pharmacy_processed_count",
+            "pharmacy_failed_count",
+            "distributor_processed_count",
+            "distributor_failed_count",
+        ])
         log_error(
             process_log=process_log,
             error_message=str(e),
@@ -1343,198 +1374,9 @@ def handle_zip_file(file, process_log, obj, pharmacy, is_reprocess=False):
         )
 
     finally:
-        # --- CLEAN TEMP FOLDER AND ZIP ---
         remove_dir_recursive(temp_dir)
         if os.path.exists(temp_zip_path):
             os.remove(temp_zip_path)
-
-
-# def handle_zip_file(file, process_log, obj, pharmacy):
-#     """
-#     Handles ZIP upload: extracts, cleans, validates, registers ProcessLogDetail entries,
-#     processes pharmacy & distributor files, logs errors, and updates failed file counts.
-#     """
-#     temp_dir = os.path.join(os.getcwd(), "temp_files")
-#     extract_to_folder = os.path.join(temp_dir, "extracted")
-    
-#     # --- CLEANUP: remove any old leftovers before starting ---
-#     remove_dir_recursive(temp_dir)
-#     os.makedirs(extract_to_folder, exist_ok=True)
-    
-#     created_files = []
-#     failed_files = []
-
-#     try:
-#         # Reset failure info before starting
-#         process_log.failed_files_json = "[]"
-#         process_log.failed_count = 0
-#         process_log.processed_count = 0
-#         process_log.save(update_fields=["failed_files_json", "failed_count", "processed_count"])
-
-#         # Save uploaded ZIP to disk
-#         temp_zip_path = os.path.join(temp_dir, "temp.zip")
-#         if isinstance(file, io.BytesIO):
-#             with open(temp_zip_path, "wb") as temp_zip_file:
-#                 temp_zip_file.write(file.getvalue())
-#         else:
-#             fs = FileSystemStorage(temp_dir)
-#             with file.open("rb") as f:
-#                 content = f.read()
-#                 fs.save(file.name, ContentFile(content))
-#             temp_zip_path = os.path.join(temp_dir, file.name)
-
-#         # Extract files
-#         extracted_files = unzip_files(temp_zip_path, extract_to_folder, process_log)
-#         validate_required_files(extracted_files, process_log)
-#         entries = os.listdir(extract_to_folder)
-
-#         # Clean and register files
-#         for extracted_file in extracted_files:
-#             if len(entries) == 1 and os.path.isdir(os.path.join(extract_to_folder, entries[0])):
-#                 folder_name = entries[0]
-#                 base_name = os.path.join(extract_to_folder, folder_name, extracted_file)
-#             else:
-#                 base_name = os.path.join(extract_to_folder, extracted_file)
-
-#             output_file = os.path.join(
-#                 os.getcwd(),
-#                 settings.AUDIT_FILES_LOCATION,
-#                 f"cleaned_{os.path.basename(base_name)}",
-#             )
-#             created_files.append(output_file)
-
-#             try:
-#                 clean_file_and_retreive_output_file(base_name, output_file)
-#             except Exception as e:
-#                 failed_files.append(os.path.basename(base_name))
-#                 log_error(
-#                     process_log=process_log,
-#                     error_message=f"Error cleaning {base_name}: {e}",
-#                     error_type="File Cleaning Error",
-#                     error_severity_code="ER",
-#                     error_location="handle_zip_file",
-#                     error_stack_trace=traceback.format_exc(),
-#                 )
-#                 continue  # Skip to next file
-
-#             file_name = os.path.basename(output_file)
-#             name, ext = os.path.splitext(file_name)
-#             if ext.lower() in {".xlsx", ".xls", ".csv"}:
-#                 columns = extract_column_names(output_file)
-#                 full_file_url = f"process/{file_name}"
-
-#                 # Detect Distributor
-#                 if "distributor" in name.lower():
-#                     distributor_name = name.replace("cleaned_", "").split("-")[1]
-#                     if Distributors.objects.filter(description__icontains=distributor_name).exists():
-#                         distributor = Distributors.objects.filter(description__icontains=distributor_name).first().id
-#                         if check_column_mappings(extracted_file, distributor, columns, process_log):
-#                             ProcessLogDetail.objects.create(
-#                                 file_type=FileType.objects.get(description="Distributor"),
-#                                 file_name=file_name,
-#                                 process_log=process_log,
-#                                 file_url=full_file_url,
-#                                 distributor=get_object_or_none(Distributors, pk=get_default_value_if_null(distributor, None)),
-#                             )
-#                     else:
-#                         failed_files.append(file_name)
-#                         log_error(
-#                             process_log=process_log,
-#                             error_message=f"Distributor '{distributor_name}' not found.",
-#                             error_type="Validation Error",
-#                             error_severity_code="ER",
-#                             error_location="handle_zip_file",
-#                         )
-
-#                 # Detect Pharmacy
-#                 elif "pharmacy" in name.lower():
-#                     pharmacy_name = name.replace("cleaned_", "").split("-")[1]
-#                     if PharmacySoftware.objects.filter(description__icontains=pharmacy_name).exists():
-#                         software = PharmacySoftware.objects.filter(description__icontains=pharmacy_name).first().id
-#                         if check_Phamacy_column_mappings(extracted_file, software, columns, process_log):
-#                             ProcessLogDetail.objects.create(
-#                                 file_type=FileType.objects.get(description="Pharmacy"),
-#                                 file_name=file_name,
-#                                 process_log=process_log,
-#                                 file_url=full_file_url,
-#                                 pharmacy=get_object_or_none(Pharmacy, pk=get_default_value_if_null(pharmacy, None)),
-#                             )
-#                             # Validate contents
-#                             process_audit_data = ProcessAuditData()
-#                             process_audit_data.validate_headers(output_file, False, pharmacy)
-#                             is_valid_file, invalid_ndcs = process_audit_data.validate_file(output_file, False, pharmacy)
-#                             if not is_valid_file:
-#                                 failed_files.append(file_name)
-#                                 log_error(
-#                                     process_log=process_log,
-#                                     error_message=f"Invalid NDCs {invalid_ndcs} in {file_name}",
-#                                     error_type="Validation Error",
-#                                     error_severity_code="ER",
-#                                     error_location="validate_file",
-#                                 )
-
-#         # Process only if no severe errors
-#         process_audit_data = ProcessAuditData()
-#         error_severity = ErrorSeverity.objects.get(code="WA").id
-#         if not ErrorLogs.objects.filter(process_log=process_log).exclude(error_severity=error_severity).exists():
-#             process_audit_data.trigger_process(obj)
-#             process_log.status = get_processing_status(ProcessingStatusCodes.Success.value)
-#         else:
-#             process_log.status = get_processing_status(ProcessingStatusCodes.Failure.value)
-
-#         # Update summary fields for UI
-#         process_log.failed_files_json = json.dumps(failed_files)
-#         process_log.failed_count = len(failed_files)
-#         process_log.processed_count = len(created_files) - len(failed_files)
-#         process_log.save(update_fields=["processed_count", "failed_count", "failed_files_json", "status"])
-
-#     except Exception as e:
-#         process_log.status = get_processing_status(ProcessingStatusCodes.Failure.value)
-#         process_log.failed_files_json = json.dumps(failed_files)
-#         process_log.failed_count = len(failed_files)
-#         process_log.save(update_fields=["status", "failed_files_json", "failed_count"])
-#         log_error(
-#             process_log=process_log,
-#             error_message=str(e),
-#             error_type="Zip Processing Error",
-#             error_severity_code="ER",
-#             error_location="handle_zip_file",
-#             error_stack_trace=traceback.format_exc(),
-#         )
-
-#     finally:
-#         remove_dir_recursive(extract_to_folder)
-#         if os.path.exists(temp_zip_path):
-#             os.remove(temp_zip_path)
-
-
-def log_failed_file(file_name, process_log):
-    """
-    Moves failed file to audit_files/failed_<name> and creates ProcessLogDetail record.
-    """
-    src_path = os.path.join(os.getcwd(), "temp_files", "extracted", file_name)
-    failed_name = f"failed_{file_name}"
-    dst_path = os.path.join(os.getcwd(), settings.AUDIT_FILES_LOCATION, failed_name)
-
-    try:
-        if os.path.exists(src_path):
-            shutil.copy2(src_path, dst_path)
-        ProcessLogDetail.objects.create(
-            process_log=process_log,
-            file_name=failed_name,
-            file_url=f"failed/{failed_name}",
-            file_type=FileType.objects.filter(description__icontains="Distributor").first(),
-        )
-    except Exception as e:
-        log_error(
-            process_log=process_log,
-            error_message=f"Error saving failed file {file_name}: {e}",
-            error_type="File Save Error",
-            error_severity_code="ER",
-            error_location="log_failed_file",
-            error_stack_trace=traceback.format_exc(),
-        )
-
 
 def cleanup_temp_dir(path):
     """Clean extracted temp directory to avoid collisions."""
@@ -1617,7 +1459,6 @@ def log_error(
 
         print(f"Failed to log error: {e}")
 
-
 def extract_column_names(file_path, sheet_name=0):
     file_extension = os.path.splitext(file_path)[1].lower()
     if file_extension == ".csv":
@@ -1628,7 +1469,6 @@ def extract_column_names(file_path, sheet_name=0):
     column_names = list(df.columns)
 
     return column_names
-
 
 def check_column_mappings(extrated_file, distributor, columns, process_log):
     mappings = FileDBMapping.objects.filter(distributor=distributor).values(
@@ -1685,7 +1525,6 @@ def check_column_mappings(extrated_file, distributor, columns, process_log):
     # all_valid = True
 
     return all_valid
-
 
 def check_Phamacy_column_mappings(
     extracted_file, pharmacysoftware, columns, process_log

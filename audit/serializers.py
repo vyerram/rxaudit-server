@@ -71,31 +71,41 @@ class ClaimStatusserializer(CoreSerializer):
         model = models.ClaimStatus
         relations = []
 
-
 class ProcessLogHdrserializer(CoreSerializer):
     process_log_detail = serializers.SerializerMethodField()
     failed_files = serializers.SerializerMethodField()
+    status_display = serializers.SerializerMethodField()
 
     class Meta(CoreSerializer.Meta):
         model = models.ProcessLogHdr
         relations = []
+        fields = [
+            "id",
+            "name",
+            "status",
+            "status_display", 
+            "log",
+            "output_file",
+            "processed_count",
+            "failed_count",
+            "pharmacy_processed_count",
+            "pharmacy_failed_count",
+            "distributor_processed_count",
+            "distributor_failed_count",
+            "failed_files_json",
+            "failed_files",
+            "process_log_detail",
+        ]
 
     def get_process_log_detail(self, obj):
         return super().retrieve_relation_data(obj, "process_log_detail_process_log")
     
     def get_failed_files(self, obj):
-        """
-        Collects failed filenames from JSON field or from ErrorLogs if JSON not populated.
-        """
-        # ✅ Preferred: use JSON field if present
         if hasattr(obj, "failed_files_json") and obj.failed_files_json:
             try:
                 return json.loads(obj.failed_files_json)
             except Exception:
                 return []
-
-        # ✅ Fallback: infer failed filenames from ErrorLogs messages
-
         logs = ErrorLogs.objects.filter(process_log=obj).values_list("error_message", flat=True)
         failed_files = []
         for msg in logs:
@@ -104,6 +114,17 @@ class ProcessLogHdrserializer(CoreSerializer):
                 if candidate not in failed_files:
                     failed_files.append(candidate)
         return failed_files
+
+    def get_status_display(self, obj):
+        """
+        Return readable status description instead of UUID.
+        """
+        if hasattr(obj, "status") and obj.status:
+            try:
+                return getattr(obj.status, "description", str(obj.status))
+            except Exception:
+                return str(obj.status)
+        return None
 
 class CleanFilesLogserializer(CoreSerializer):
 

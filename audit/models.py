@@ -70,14 +70,19 @@ class ProcessLogHdr(CoreModel):
     )
     processed_count = models.IntegerField(db_column="plg_processed_count", blank=True, null=True)
     failed_count = models.IntegerField(db_column="plg_failed_count", blank=True, null=True)
+    # Add new pharmacy/distributor specific counters
+    pharmacy_processed_count = models.IntegerField(default=0)
+    pharmacy_failed_count = models.IntegerField(default=0)
+    distributor_processed_count = models.IntegerField(default=0)
+    distributor_failed_count = models.IntegerField(default=0)
+    
     failed_files_json = models.JSONField(db_column="plg_failed_files", blank=True, null=True)
 
     class Meta:
         db_table = "OPT_PLG_ProcessLogHdr"
 
     def __str__(self):
-        return self.name
-
+        return f"{self.name or 'Audit Process'} ({self.status})"
 
 class CleanFilesLog(CoreModel):
     name = models.CharField(db_column="cfl_name", max_length=128)

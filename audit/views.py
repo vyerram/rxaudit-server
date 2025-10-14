@@ -159,11 +159,27 @@ class ProcessLogHdrviewset(CoreViewset):
             process_log = self.get_object()
             pharmacy = request.data.get("pharmacy")
 
-            # Reset counters before re-run
+            # --- RESET COUNTERS BEFORE RE-RUN ---
             process_log.failed_files_json = "[]"
             process_log.failed_count = 0
+            # process_log.processed_count = 0  # NEW: ensure total resets too
+            # # NEW: reset detailed per-category counts
+            # process_log.pharmacy_processed_count = 0
+            # process_log.pharmacy_failed_count = 0
+            # process_log.distributor_processed_count = 0
+            # process_log.distributor_failed_count = 0
             process_log.status = get_processing_status(ProcessingStatusCodes.Inprogress.value)
-            process_log.save(update_fields=["failed_files_json", "failed_count", "status"])
+            process_log.save(update_fields=[
+                "failed_files_json",
+                "failed_count",
+                # "processed_count",
+                "status",
+                # NEW:
+                # "pharmacy_processed_count",
+                # "pharmacy_failed_count",
+                # "distributor_processed_count",
+                # "distributor_failed_count",
+            ])
 
             uploaded_files = request.FILES.getlist("file")
             zip_buffer = None
@@ -207,34 +223,7 @@ class ProcessLogHdrviewset(CoreViewset):
                     status=status.HTTP_200_OK,
                 )
 
-            # # --- CASE 2: user didn’t upload → auto find failed_*.xlsx ---
-            # failed_dir = os.path.join(os.getcwd(), settings.AUDIT_FILES_LOCATION)
-            # failed_files = [
-            #     f for f in os.listdir(failed_dir)
-            #     if f.startswith("failed_") and f.endswith(".xlsx")
-            # ]
-
-            # if not failed_files:
-            #     return Response({"message": "No failed files found to reprocess."},
-            #                     status=status.HTTP_200_OK)
-
-            # zip_buffer = io.BytesIO()
-            # with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-            #     for f in failed_files:
-            #         file_path = os.path.join(failed_dir, f)
-            #         zf.write(file_path, arcname=f.replace("failed_", "reprocess_"))
-            # zip_buffer.seek(0)
-
-            # t = threading.Thread(
-            #     target=handle_zip_file,
-            #     args=[zip_buffer, process_log, process_log, pharmacy],
-            #     daemon=True,
-            # )
-            # t.start()
-            # return Response(
-            #     {"message": f"Automatically reprocessing {len(failed_files)} failed files."},
-            #     status=status.HTTP_200_OK,
-            # )
+            # (Auto reprocess section remains commented out — optional to re-enable later)
 
         except Exception as e:
             log_error(
@@ -245,7 +234,6 @@ class ProcessLogHdrviewset(CoreViewset):
                 error_location="reprocess_failed",
             )
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
-
 
     def get_queryset(self):
         queryset = super().get_queryset()
