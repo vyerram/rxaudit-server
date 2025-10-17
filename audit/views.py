@@ -151,79 +151,62 @@ class ProcessLogHdrviewset(CoreViewset):
     @action(detail=True, methods=[HTTPMethod.POST])
     def reprocess_failed(self, request, pk):
         """
-        Reprocesses failed files. 
-        Supports both automatic reprocessing of server-stored failed_*.xlsx
-        and manual re-upload (ZIP or individual files).
+        Reprocesses failed files with uploaded files.
+        Supports manual re-upload (ZIP or individual files).
         """
         try:
             process_log = self.get_object()
             pharmacy = request.data.get("pharmacy")
 
-            # --- RESET COUNTERS BEFORE RE-RUN ---
-            process_log.failed_files_json = "[]"
-            process_log.failed_count = 0
-            # process_log.processed_count = 0  # NEW: ensure total resets too
-            # # NEW: reset detailed per-category counts
-            # process_log.pharmacy_processed_count = 0
-            # process_log.pharmacy_failed_count = 0
-            # process_log.distributor_processed_count = 0
-            # process_log.distributor_failed_count = 0
+            # Set status to in-progress
             process_log.status = get_processing_status(ProcessingStatusCodes.Inprogress.value)
-            process_log.save(update_fields=[
-                "failed_files_json",
-                "failed_count",
-                # "processed_count",
-                "status",
-                # NEW:
-                # "pharmacy_processed_count",
-                # "pharmacy_failed_count",
-                # "distributor_processed_count",
-                # "distributor_failed_count",
-            ])
+            process_log.save(update_fields=["status"])
 
             uploaded_files = request.FILES.getlist("file")
-            zip_buffer = None
-
-            # --- CASE 1: user uploaded something ---
-            if uploaded_files:
-                # Check if any uploaded file is a ZIP
-                is_zip = any(
-                    f.name.endswith(".zip") or f.content_type == "application/zip"
-                    for f in uploaded_files
+            
+            if not uploaded_files:
+                return Response(
+                    {"error": "No files provided for reprocessing"},
+                    status=status.HTTP_400_BAD_REQUEST
                 )
 
-                if is_zip:
-                    # Take the first ZIP
-                    zip_file = next(f for f in uploaded_files if f.name.endswith(".zip"))
-                    t = threading.Thread(
-                        target=handle_zip_file,
-                        args=[zip_file, process_log, process_log, pharmacy, True],
-                        daemon=True,
-                    )
-                    t.start()
-                    return Response(
-                        {"message": "Uploaded ZIP accepted. Reprocessing started."},
-                        status=status.HTTP_200_OK,
-                    )
+            # Check if any uploaded file is a ZIP
+            is_zip = any(
+                f.name.endswith(".zip") or f.content_type == "application/zip"
+                for f in uploaded_files
+            )
 
-                # Otherwise multiple single files (xlsx/csv)
-                zip_buffer = io.BytesIO()
-                with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-                    for f in uploaded_files:
-                        zf.writestr(f.name, f.read())
-                zip_buffer.seek(0)
+            if is_zip:
+                # Take the first ZIP
+                zip_file = next(f for f in uploaded_files if f.name.endswith(".zip"))
                 t = threading.Thread(
                     target=handle_zip_file,
-                    args=[zip_buffer, process_log, process_log, pharmacy, True],
+                    args=[zip_file, process_log, process_log, pharmacy, True],
                     daemon=True,
                 )
                 t.start()
                 return Response(
-                    {"message": f"Uploaded {len(uploaded_files)} files reprocessing started."},
+                    {"message": "Uploaded ZIP accepted. Reprocessing started."},
                     status=status.HTTP_200_OK,
                 )
 
-            # (Auto reprocess section remains commented out — optional to re-enable later)
+            # Otherwise multiple single files (xlsx/csv)
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+                for f in uploaded_files:
+                    zf.writestr(f.name, f.read())
+            zip_buffer.seek(0)
+            
+            t = threading.Thread(
+                target=handle_zip_file,
+                args=[zip_buffer, process_log, process_log, pharmacy, True],
+                daemon=True,
+            )
+            t.start()
+            return Response(
+                {"message": f"Uploaded {len(uploaded_files)} files reprocessing started."},
+                status=status.HTTP_200_OK,
+            )
 
         except Exception as e:
             log_error(
@@ -269,15 +252,6 @@ class ProcessLogHdrviewset(CoreViewset):
                 "Triggered process execution, check this space in few minutes"
             )
         except Exception as e:
-            # log_error(
-            #     process_log=obj.id,
-            #     error_message="Invalid Pack size data for NDCs detected "
-            #     + str(invalid_ndcs),
-            #     error_type="Validation Error",
-            #     error_severity_code="ER",
-            #     error_location="validate_file",
-            #     error_stack_trace=traceback.format_exc(),
-            # )
             obj.status = get_processing_status(ProcessingStatusCodes.Failure.value)
             obj.log = str(e)
             obj.save()
@@ -313,18 +287,27 @@ class ProcessLogHdrviewset(CoreViewset):
             process_log = ProcessLogHdr.objects.get(pk=pk)
             obj = process_log
 
-            # ✅ Reset old failed list and status before starting new run
-            obj.failed_files_json = "[]"
-            obj.failed_count = 0
+            # Check if this is a resubmission
+            is_resubmission = request.data.get("is_resubmission", "false").lower() == "true"
+
+            if not is_resubmission:
+                # Reset counters for initial run
+                obj.failed_files_json = "[]"
+                obj.failed_count = 0
+                obj.pharmacy_processed_count = 0
+                obj.pharmacy_failed_count = 0
+                obj.distributor_processed_count = 0
+                obj.distributor_failed_count = 0
+            
             obj.status = get_processing_status(ProcessingStatusCodes.Inprogress.value)
-            obj.save(update_fields=["failed_files_json", "failed_count", "status"])
+            obj.save()
 
             data = request.data
-
-            uploaded_files = request.FILES.getlist("file")  # List of uploaded files
+            uploaded_files = request.FILES.getlist("file")
 
             if not uploaded_files:
                 raise Exception("No files provided")
+            
             is_zip = False
             for uploaded_file in uploaded_files:
                 if (
@@ -332,7 +315,7 @@ class ProcessLogHdrviewset(CoreViewset):
                     or uploaded_file.content_type == "application/zip"
                 ):
                     is_zip = True
-                    zip_file = uploaded_file  # Save the ZIP file for processing
+                    zip_file = uploaded_file
                     break
 
             if is_zip:
@@ -343,7 +326,8 @@ class ProcessLogHdrviewset(CoreViewset):
                         process_log,
                         obj,
                         data.get("pharmacy"),
-                    ],  # Pass the ZIP file directly
+                        is_resubmission,
+                    ],
                     daemon=True,
                 )
                 t.start()
@@ -356,7 +340,7 @@ class ProcessLogHdrviewset(CoreViewset):
                 pharmacy = data.get("pharmacy")
                 t = threading.Thread(
                     target=handle_zip_file,
-                    args=[zip_buffer, process_log, obj, pharmacy],
+                    args=[zip_buffer, process_log, obj, pharmacy, is_resubmission],
                     daemon=True,
                 )
                 t.start()
@@ -379,6 +363,25 @@ class ProcessLogHdrviewset(CoreViewset):
                 {"error": str(e)},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+    @action(detail=True, methods=[HTTPMethod.GET])
+    def get_progress(self, request, pk):
+        """
+        Returns current progress for polling.
+        """
+        try:
+            obj = self.get_object()
+            return Response({
+                "status": obj.status.description if obj.status else "Unknown",
+                "pharmacy_processed_count": obj.pharmacy_processed_count or 0,
+                "pharmacy_failed_count": obj.pharmacy_failed_count or 0,
+                "distributor_processed_count": obj.distributor_processed_count or 0,
+                "distributor_failed_count": obj.distributor_failed_count or 0,
+                "failed_files_json": obj.failed_files_json or "[]",
+                "output_file": obj.output_file or None,
+            }, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
 
 class ProcessLogDetailviewset(CoreViewset):
@@ -527,7 +530,7 @@ class CleanFilesLogviewset(CoreViewset):
         )
         name, extension = os.path.splitext(full_file_name)
         with open(full_file_name, "rb") as output_content:
-            content_type = "text/csv"  # Default to CSV
+            content_type = "text/csv"
             if extension == ".xls":
                 content_type = "application/vnd.ms-excel"
             elif extension == ".xlsx":
