@@ -1098,7 +1098,8 @@ def validate_required_files(extracted_files, process_log):
         )
 # Add this to your util.py file - Replace the existing handle_zip_file function
 
-def handle_zip_file(file, process_log, obj, pharmacy, is_resubmission=False):
+def handle_zip_file(file, process_log, obj, pharmacy, is_resubmission=False, process_folder=None):
+
     """
     Handles both initial and reprocess ZIP uploads.
 
@@ -1113,6 +1114,11 @@ def handle_zip_file(file, process_log, obj, pharmacy, is_resubmission=False):
     import shutil
 
     # --- SETUP TEMP FOLDERS ---
+# Use process_folder if provided, otherwise fall back to process name
+    if process_folder is None:
+        process_folder = os.path.join(settings.AUDIT_FILES_LOCATION, process_log.name)
+        os.makedirs(os.path.join(os.getcwd(), process_folder), exist_ok=True)
+
     temp_dir = os.path.join(os.getcwd(), "temp_files", f"process_{process_log.id}")
     extract_to_folder = os.path.join(temp_dir, "extracted")
     remove_dir_recursive(temp_dir)
@@ -1145,7 +1151,7 @@ def handle_zip_file(file, process_log, obj, pharmacy, is_resubmission=False):
                     failed_list = []
 
             # 4. Remove ProcessLogDetail + audit files for failed files only
-            audit_dir = os.path.join(os.getcwd(), settings.AUDIT_FILES_LOCATION)
+            audit_dir = os.path.join(os.getcwd(), process_folder)
             for failed_name in failed_list:
                 possible_names = [failed_name, f"cleaned_{failed_name}"]
 
@@ -1209,9 +1215,9 @@ def handle_zip_file(file, process_log, obj, pharmacy, is_resubmission=False):
             original_name = os.path.basename(base_name)
             output_file = os.path.join(
                 os.getcwd(),
-                settings.AUDIT_FILES_LOCATION,
+                process_folder,
                 f"cleaned_{original_name}",
-            )
+                )   
             created_files.append(output_file)
 
             is_pharmacy_file = "pharmacy" in original_name.lower()
@@ -1324,7 +1330,8 @@ def handle_zip_file(file, process_log, obj, pharmacy, is_resubmission=False):
                             pharmacy_failed += 1
 
         # --- CLEAN FAILED FILES FROM AUDIT FOLDER ---
-        audit_dir = os.path.join(os.getcwd(), settings.AUDIT_FILES_LOCATION)
+        # --- CLEAN FAILED FILES FROM AUDIT FOLDER ---
+        audit_dir = os.path.join(os.getcwd(), process_folder)
         for failed in failed_files:
             possible_names = [failed, f"cleaned_{failed}"]
             for name in possible_names:

@@ -60,7 +60,9 @@ class FileDBMappingviewset(CoreViewset):
             data = request.data
             file = data.get("file")
             file_name = file.name
-            file_location = os.path.join(os.getcwd(), settings.AUDIT_FILES_LOCATION)
+            process_name = data.get("process_name", "temp")  # Get process name from request
+            file_location = os.path.join(os.getcwd(), settings.AUDIT_FILES_LOCATION, process_name)
+            os.makedirs(file_location, exist_ok=True)  # Create folder if doesn't exist
             fs = FileSystemStorage(file_location)
             fs.save(file_name, ContentFile(file.read()))
             full_file_name = os.path.join(file_location, file_name)
@@ -158,6 +160,9 @@ class ProcessLogHdrviewset(CoreViewset):
             process_log = self.get_object()
             pharmacy = request.data.get("pharmacy")
 
+            process_folder = os.path.join(settings.AUDIT_FILES_LOCATION, process_log.name)
+            os.makedirs(process_folder, exist_ok=True)
+            
             # Set status to in-progress
             process_log.status = get_processing_status(ProcessingStatusCodes.Inprogress.value)
             process_log.save(update_fields=["status"])
@@ -272,9 +277,7 @@ class ProcessLogHdrviewset(CoreViewset):
     def download_file(self, request, pk):
         obj = self.get_object()
         file_name = os.path.basename(obj.output_file)
-        full_file_name = os.path.join(
-            os.getcwd(), settings.AUDIT_FILES_LOCATION, file_name
-        )
+        full_file_name = os.path.join(os.getcwd(), settings.AUDIT_FILES_LOCATION, obj.name, file_name)
         download_file(full_file_name, obj.output_file)
         response = HttpResponse(
             FileWrapper(open(full_file_name, "rb")), content_type="application/pdf"
@@ -287,6 +290,13 @@ class ProcessLogHdrviewset(CoreViewset):
             process_log = ProcessLogHdr.objects.get(pk=pk)
             obj = process_log
 
+            # <<<< IMMEDIATELY SET STATUS TO IN PROGRESS >>>>
+            obj.status = get_processing_status(ProcessingStatusCodes.Inprogress.value)
+            obj.save(update_fields=["status"])  # <<<< Save immediately so UI sees "In Progress"
+
+            process_folder = os.path.join(settings.AUDIT_FILES_LOCATION, obj.name)
+            os.makedirs(process_folder, exist_ok=True)
+        
             # Check if this is a resubmission
             is_resubmission = request.data.get("is_resubmission", "false").lower() == "true"
 
@@ -298,9 +308,7 @@ class ProcessLogHdrviewset(CoreViewset):
                 obj.pharmacy_failed_count = 0
                 obj.distributor_processed_count = 0
                 obj.distributor_failed_count = 0
-            
-            obj.status = get_processing_status(ProcessingStatusCodes.Inprogress.value)
-            obj.save()
+                obj.save() 
 
             data = request.data
             uploaded_files = request.FILES.getlist("file")
@@ -391,9 +399,7 @@ class ProcessLogDetailviewset(CoreViewset):
     @action(detail=True, methods=[HTTPMethod.GET])
     def download_file(self, request, pk):
         obj = self.get_object()
-        full_file_name = os.path.join(
-            os.getcwd(), settings.AUDIT_FILES_LOCATION, obj.file_name
-        )
+        full_file_name = os.path.join(os.getcwd(), settings.AUDIT_FILES_LOCATION, obj.name, file_name)
         download_file(full_file_name, obj.file_url)
         response = HttpResponse(
             FileWrapper(open(full_file_name, "rb")), content_type="application/pdf"
@@ -443,7 +449,9 @@ class ProcessLogDetailviewset(CoreViewset):
             pharmacy = data.get("pharmacy")
             process_audit_data = ProcessAuditData()
             file_name = file.name
-            file_location = os.path.join(os.getcwd(), settings.AUDIT_FILES_LOCATION)
+            process_name = data.get("process_name", "temp")
+            file_location = os.path.join(os.getcwd(), settings.AUDIT_FILES_LOCATION, process_name)
+            os.makedirs(file_location, exist_ok=True)
             fs = FileSystemStorage(file_location)
             fs.save(file_name, ContentFile(file.read()))
             full_file_name = os.path.join(file_location, file_name)
