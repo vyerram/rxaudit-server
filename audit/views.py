@@ -300,24 +300,20 @@ class ProcessLogHdrviewset(CoreViewset):
     def download_file(self, request, pk):
         obj = self.get_object()
         
-        #  Use pre-signed URLs instead of downloading to server
         if not obj.output_file:
             return Response(
                 {"error": "No output file available"}, 
                 status=status.HTTP_404_NOT_FOUND
             )
         
-        # Extract S3 key from file_url (format: "bucket_name/process_name/file.xlsx")
         object_key = obj.output_file.replace(f"{settings.AWS_BUCKET}/", "")
         
-        # Generate pre-signed URL (no server download needed)
         from core.utils import get_s3_file_location
         download_url = get_s3_file_location(settings.AWS_BUCKET, object_key)
         
-        # Redirect user to S3 pre-signed URL
-        from django.http import HttpResponseRedirect
-        return HttpResponseRedirect(download_url)
-
+        # ✅ Return JSON instead of redirect
+        return Response({"download_url": download_url}, status=status.HTTP_200_OK)
+    
     @action(detail=True, methods=[HTTPMethod.POST])
     def automation_process(self, request, pk):
         try:
@@ -435,23 +431,19 @@ class ProcessLogDetailviewset(CoreViewset):
     def download_file(self, request, pk):
         obj = self.get_object()
         
-        #  Use pre-signed URLs instead of downloading to server
         if not obj.file_url:
             return Response(
                 {"error": "No file available"}, 
                 status=status.HTTP_404_NOT_FOUND
             )
         
-        # Extract S3 key from file_url
         object_key = obj.file_url.replace(f"{settings.AWS_BUCKET}/", "")
         
-        # Generate pre-signed URL
         from core.utils import get_s3_file_location
         download_url = get_s3_file_location(settings.AWS_BUCKET, object_key)
         
-        # Redirect to S3
-        from django.http import HttpResponseRedirect
-        return HttpResponseRedirect(download_url)
+        # ✅ Return JSON instead of redirect
+        return Response({"download_url": download_url}, status=status.HTTP_200_OK)
 
     @action(detail=False, methods=[HTTPMethod.POST])
     def add_log(self, request):
