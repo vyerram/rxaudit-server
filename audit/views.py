@@ -27,6 +27,7 @@ import zipfile
 from .models import ProcessLogHdr
 from core.utils import get_boto3_client
 import io
+from django.db.models import Q
 
 
 class PharmacyAuditDataviewset(CoreViewset):
@@ -226,18 +227,33 @@ class ProcessLogHdrviewset(CoreViewset):
     def get_queryset(self):
         queryset = super().get_queryset()
         request_user = self.request.user
+        
         if request_user.pharmacy:
+            # Include both:
+            # 1. Logs with ProcessLogDetail entries for this pharmacy
+            # 2. Logs created recently (within last hour) that might not have details yet
+            from django.utils import timezone
+            from datetime import timedelta
+            
+            recent_cutoff = timezone.now() - timedelta(hours=1)
+            
             queryset = queryset.filter(
-                process_log_detail_process_log__pharmacy=request_user.pharmacy.id
-            )
+                Q(process_log_detail_process_log__pharmacy=request_user.pharmacy.id) |
+                Q(created_at__gte=recent_cutoff)
+            ).distinct()
+            
         elif request_user.volume_group:
             pharmacies_to_volume_group = Pharmacy.objects.filter(
                 volume_group=request_user.volume_group.id
-            ).values_list("id")
-            pharmacy_list = [val[0] for val in pharmacies_to_volume_group]
+            ).values_list("id", flat=True)
+            
+            recent_cutoff = timezone.now() - timedelta(hours=1)
+            
             queryset = queryset.filter(
-                process_log_detail_process_log__pharmacy__in=pharmacy_list
-            )
+                Q(process_log_detail_process_log__pharmacy__in=pharmacies_to_volume_group) |
+                Q(created_at__gte=recent_cutoff)
+            ).distinct()
+            
         return queryset
 
     @action(detail=True, methods=[HTTPMethod.POST])
@@ -266,23 +282,41 @@ class ProcessLogHdrviewset(CoreViewset):
 
     def destroy(self, request, *args, **kwargs):
         instance = self.get_object()
+        
+        # Clean up S3 files before deleting DB records
+        from .util import cleanup_s3_folder
+        cleanup_s3_folder(instance.name)
+        
+        # Delete related records
         instance.process_log_detail_process_log.all().delete()
         instance.pharmacy_process_log.all().delete()
         instance.distributor_process_log.all().delete()
         instance.error_log_process_log.all().delete()
-        super().perform_destroy(instance)
+        instance.delete()   
+         
         return Response(status=status.HTTP_204_NO_CONTENT)
-
+    
     @action(detail=True, methods=[HTTPMethod.GET])
     def download_file(self, request, pk):
         obj = self.get_object()
-        file_name = os.path.basename(obj.output_file)
-        full_file_name = os.path.join(os.getcwd(), settings.AUDIT_FILES_LOCATION, obj.name, file_name)
-        download_file(full_file_name, obj.output_file)
-        response = HttpResponse(
-            FileWrapper(open(full_file_name, "rb")), content_type="application/pdf"
-        )
-        return response
+        
+        #  Use pre-signed URLs instead of downloading to server
+        if not obj.output_file:
+            return Response(
+                {"error": "No output file available"}, 
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Extract S3 key from file_url (format: "bucket_name/process_name/file.xlsx")
+        object_key = obj.output_file.replace(f"{settings.AWS_BUCKET}/", "")
+        
+        # Generate pre-signed URL (no server download needed)
+        from core.utils import get_s3_file_location
+        download_url = get_s3_file_location(settings.AWS_BUCKET, object_key)
+        
+        # Redirect user to S3 pre-signed URL
+        from django.http import HttpResponseRedirect
+        return HttpResponseRedirect(download_url)
 
     @action(detail=True, methods=[HTTPMethod.POST])
     def automation_process(self, request, pk):
@@ -291,8 +325,9 @@ class ProcessLogHdrviewset(CoreViewset):
             obj = process_log
 
             # <<<< IMMEDIATELY SET STATUS TO IN PROGRESS >>>>
-            obj.status = get_processing_status(ProcessingStatusCodes.Inprogress.value)
-            obj.save(update_fields=["status"])  # <<<< Save immediately so UI sees "In Progress"
+            with transaction.atomic():
+                obj.status = get_processing_status(ProcessingStatusCodes.Inprogress.value)
+                obj.save(update_fields=["status"])  # <<<< Save immediately so UI sees "In Progress"
 
             process_folder = os.path.join(settings.AUDIT_FILES_LOCATION, obj.name)
             os.makedirs(process_folder, exist_ok=True)
@@ -399,12 +434,24 @@ class ProcessLogDetailviewset(CoreViewset):
     @action(detail=True, methods=[HTTPMethod.GET])
     def download_file(self, request, pk):
         obj = self.get_object()
-        full_file_name = os.path.join(os.getcwd(), settings.AUDIT_FILES_LOCATION, obj.name, file_name)
-        download_file(full_file_name, obj.file_url)
-        response = HttpResponse(
-            FileWrapper(open(full_file_name, "rb")), content_type="application/pdf"
-        )
-        return response
+        
+        #  Use pre-signed URLs instead of downloading to server
+        if not obj.file_url:
+            return Response(
+                {"error": "No file available"}, 
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Extract S3 key from file_url
+        object_key = obj.file_url.replace(f"{settings.AWS_BUCKET}/", "")
+        
+        # Generate pre-signed URL
+        from core.utils import get_s3_file_location
+        download_url = get_s3_file_location(settings.AWS_BUCKET, object_key)
+        
+        # Redirect to S3
+        from django.http import HttpResponseRedirect
+        return HttpResponseRedirect(download_url)
 
     @action(detail=False, methods=[HTTPMethod.POST])
     def add_log(self, request):

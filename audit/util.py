@@ -17,6 +17,7 @@ from core.utils import (
     get_default_value_if_null,
     upload_file,
     get_object_or_none,
+    get_boto3_client,
 )
 from .constants import (
     DateFormats,
@@ -51,6 +52,7 @@ import zipfile
 from django.core.files.storage import FileSystemStorage
 from django.core.files.base import ContentFile
 import io
+from botocore.exceptions import ClientError
 
 
 class ProcessAuditData:
@@ -918,19 +920,7 @@ def batch_process_files(file_location, file_name, file, obj, output_file_name):
                                 "cleaned-"
                                 + os.path.basename(file_info.filename).lower(),
                             )
-                            #         thread = threading.Thread(
-                            #             target=clean_file_and_retreive_output_file,
-                            #             args=(
-                            #                 os.path.join(name, file_info.filename).lower(),
-                            #                 os.path.join(
-                            #                     file_location, cleaned_path
-                            #                 ).lower(),
-                            #             ),
-                            #         )
-                            #         threads.append(thread)
-                            #         thread.start()
-                            # for thread in threads:
-                            #     thread.join()
+ 
                             clean_file_and_retreive_output_file(
                                 os.path.join(name, file_info.filename),
                                 os.path.join(file_location, cleaned_path),
@@ -1096,25 +1086,14 @@ def validate_required_files(extracted_files, process_log):
             error_severity_code="ER",
             error_location="validate_required_files",
         )
-# Add this to your util.py file - Replace the existing handle_zip_file function
 
 def handle_zip_file(file, process_log, obj, pharmacy, is_resubmission=False, process_folder=None):
-
     """
     Handles both initial and reprocess ZIP uploads.
-
-    Key behaviors:
-    - Creates a process-specific temp workspace.
-    - Cleans, validates, and registers processed files.
-    - During reprocess: removes only failed files (keeps successful ones).
-    - Accurately updates processed/failed counts even if exceptions occur.
-    - Tracks pharmacy and distributor counts separately.
+    All files uploaded to S3, local disk is temporary workspace only.
     """
-
     import shutil
-
-    # --- SETUP TEMP FOLDERS ---
-# Use process_folder if provided, otherwise fall back to process name
+    # Use process_folder if provided, otherwise fall back to process name
     if process_folder is None:
         process_folder = os.path.join(settings.AUDIT_FILES_LOCATION, process_log.name)
         os.makedirs(os.path.join(os.getcwd(), process_folder), exist_ok=True)
@@ -1135,14 +1114,11 @@ def handle_zip_file(file, process_log, obj, pharmacy, is_resubmission=False, pro
         if is_resubmission:
             print(f"♻️ Starting reprocess for Process ID: {process_log.id}")
 
-            # 1. Mark process header as In Progress
             process_log.status = get_processing_status(ProcessingStatusCodes.Inprogress.value)
             process_log.save(update_fields=["status"])
 
-            # 2. Remove old error logs
             ErrorLogs.objects.filter(process_log=process_log).delete()
 
-            # 3. Parse failed file names from previous run
             failed_list = []
             if process_log.failed_files_json and process_log.failed_files_json != "[]":
                 try:
@@ -1150,17 +1126,28 @@ def handle_zip_file(file, process_log, obj, pharmacy, is_resubmission=False, pro
                 except Exception:
                     failed_list = []
 
-            # 4. Remove ProcessLogDetail + audit files for failed files only
+            #  Delete old failed files from S3 during reprocess
+            s3_client = get_boto3_client()
             audit_dir = os.path.join(os.getcwd(), process_folder)
+            
             for failed_name in failed_list:
                 possible_names = [failed_name, f"cleaned_{failed_name}"]
-
-                # Delete DB entries for failed files
+                
+                # Delete DB entries
                 ProcessLogDetail.objects.filter(
                     process_log=process_log, file_name__in=possible_names
                 ).delete()
 
-                # Delete physical files for those failed ones
+                # Delete from S3 FIRST
+                for name in possible_names:
+                    s3_key = f"{process_log.name}/{name}"
+                    try:
+                        s3_client.delete_object(Bucket=settings.AWS_BUCKET, Key=s3_key)
+                        print(f"🗑️ Deleted from S3: {s3_key}")
+                    except Exception as e:
+                        print(f" Could not delete from S3 {s3_key}: {e}")
+
+                # Delete local files
                 for name in possible_names:
                     fpath = os.path.join(audit_dir, name)
                     if os.path.exists(fpath):
@@ -1168,13 +1155,11 @@ def handle_zip_file(file, process_log, obj, pharmacy, is_resubmission=False, pro
                             os.remove(fpath)
                             print(f"🧹 Removed previously failed file: {name}")
                         except Exception as e:
-                            print(f"⚠️ Could not remove failed file {name}: {e}")
+                            print(f" Could not remove failed file {name}: {e}")
 
-            # Keep existing successful counts
             pharmacy_processed = process_log.pharmacy_processed_count or 0
             distributor_processed = process_log.distributor_processed_count or 0
         else:
-            # Reset all counters for initial run
             process_log.failed_files_json = "[]"
             process_log.failed_count = 0
             process_log.pharmacy_processed_count = 0
@@ -1183,7 +1168,7 @@ def handle_zip_file(file, process_log, obj, pharmacy, is_resubmission=False, pro
             process_log.distributor_failed_count = 0
             process_log.save()
 
-        # --- SAVE UPLOADED ZIP ---
+        # Save uploaded ZIP
         temp_zip_path = os.path.join(temp_dir, "temp.zip")
         if isinstance(file, io.BytesIO):
             with open(temp_zip_path, "wb") as temp_zip_file:
@@ -1195,16 +1180,15 @@ def handle_zip_file(file, process_log, obj, pharmacy, is_resubmission=False, pro
                 fs.save(file.name, ContentFile(content))
             temp_zip_path = os.path.join(temp_dir, file.name)
 
-        # --- EXTRACT FILES ---
+        # Extract files
         extracted_files = unzip_files(temp_zip_path, extract_to_folder, process_log)
 
-        # --- VALIDATE REQUIRED FILES (ONLY FOR INITIAL RUN) ---
         if not is_resubmission:
             validate_required_files(extracted_files, process_log)
 
         entries = os.listdir(extract_to_folder)
 
-        # --- CLEAN & REGISTER FILES ---
+        # Clean & register files
         for extracted_file in extracted_files:
             if len(entries) == 1 and os.path.isdir(os.path.join(extract_to_folder, entries[0])):
                 folder_name = entries[0]
@@ -1213,11 +1197,7 @@ def handle_zip_file(file, process_log, obj, pharmacy, is_resubmission=False, pro
                 base_name = os.path.join(extract_to_folder, extracted_file)
 
             original_name = os.path.basename(base_name)
-            output_file = os.path.join(
-                os.getcwd(),
-                process_folder,
-                f"cleaned_{original_name}",
-                )   
+            output_file = os.path.join(os.getcwd(), process_folder, f"cleaned_{original_name}")   
             created_files.append(output_file)
 
             is_pharmacy_file = "pharmacy" in original_name.lower()
@@ -1247,9 +1227,11 @@ def handle_zip_file(file, process_log, obj, pharmacy, is_resubmission=False, pro
             
             if ext.lower() in {".xlsx", ".xls", ".csv"}:
                 columns = extract_column_names(output_file)
-                full_file_url = f"process/{file_name}"
+                
+                # S3-FIRST: Use full S3 path for file_url
+                full_file_url = f"{settings.AWS_BUCKET}/{process_log.name}/{file_name}"
 
-                # --- DISTRIBUTOR FILE ---
+                # DISTRIBUTOR FILE
                 if is_distributor_file:
                     distributor_name = name.replace("cleaned_", "").split("-")[1]
                     if Distributors.objects.filter(description__icontains=distributor_name).exists():
@@ -1265,7 +1247,7 @@ def handle_zip_file(file, process_log, obj, pharmacy, is_resubmission=False, pro
                                 file_type=FileType.objects.get(description="Distributor"),
                                 file_name=file_name,
                                 process_log=process_log,
-                                file_url=full_file_url,
+                                file_url=full_file_url,  # Full S3 path
                                 distributor=get_object_or_none(
                                     Distributors,
                                     pk=get_default_value_if_null(distributor, None),
@@ -1286,7 +1268,7 @@ def handle_zip_file(file, process_log, obj, pharmacy, is_resubmission=False, pro
                             error_location="handle_zip_file",
                         )
 
-                # --- PHARMACY FILE ---
+                # PHARMACY FILE
                 elif is_pharmacy_file:
                     pharmacy_name = name.replace("cleaned_", "").split("-")[1]
                     if PharmacySoftware.objects.filter(description__icontains=pharmacy_name).exists():
@@ -1302,12 +1284,11 @@ def handle_zip_file(file, process_log, obj, pharmacy, is_resubmission=False, pro
                                 file_type=FileType.objects.get(description="Pharmacy"),
                                 file_name=file_name,
                                 process_log=process_log,
-                                file_url=full_file_url,
+                                file_url=full_file_url,  # Full S3 path
                                 pharmacy=get_object_or_none(
                                     Pharmacy, pk=get_default_value_if_null(pharmacy, None)
                                 ),
                             )
-                            # Validate content
                             process_audit_data = ProcessAuditData()
                             process_audit_data.validate_headers(output_file, False, pharmacy)
                             is_valid_file, invalid_ndcs = process_audit_data.validate_file(
@@ -1329,8 +1310,10 @@ def handle_zip_file(file, process_log, obj, pharmacy, is_resubmission=False, pro
                             failed_files.append(original_name)
                             pharmacy_failed += 1
 
-        # --- CLEAN FAILED FILES FROM AUDIT FOLDER ---
-        # --- CLEAN FAILED FILES FROM AUDIT FOLDER ---
+        # Upload ALL files to S3 FIRST (successful + failed for forensics)
+        upload_process_folder_to_s3(process_log.name)
+        
+        # THEN clean failed files from local audit folder (after S3 upload)
         audit_dir = os.path.join(os.getcwd(), process_folder)
         for failed in failed_files:
             possible_names = [failed, f"cleaned_{failed}"]
@@ -1339,23 +1322,25 @@ def handle_zip_file(file, process_log, obj, pharmacy, is_resubmission=False, pro
                 if os.path.exists(fpath):
                     try:
                         os.remove(fpath)
-                        print(f"🧹 Removed failed file from audit folder: {fpath}")
+                        print(f"🧹 Removed failed file from local audit folder: {fpath}")
                     except Exception as e:
-                        print(f"⚠️ Could not remove failed file {fpath}: {e}")
+                        print(f" Could not remove failed file {fpath}: {e}")
 
-        # --- TRIGGER FINAL REPORT ---
+        # Trigger final report
         process_audit_data = ProcessAuditData()
         error_severity = ErrorSeverity.objects.get(code="WA").id
         
+        # Don't set status here - trigger_process handles it
         if not ErrorLogs.objects.filter(process_log=process_log).exclude(
             error_severity=error_severity
         ).exists():
+            # trigger_process sets status to Success in generate_output_report()
             process_audit_data.trigger_process(obj)
-            process_log.status = get_processing_status(ProcessingStatusCodes.Success.value)
         else:
+            # Only set failure status if there are errors
             process_log.status = get_processing_status(ProcessingStatusCodes.Failure.value)
 
-        # --- UPDATE COUNTS FOR UI ---
+        # Update counts
         process_log.failed_files_json = json.dumps(failed_files)
         process_log.failed_count = len(failed_files)
         process_log.pharmacy_processed_count = pharmacy_processed
@@ -1363,20 +1348,28 @@ def handle_zip_file(file, process_log, obj, pharmacy, is_resubmission=False, pro
         process_log.distributor_processed_count = distributor_processed
         process_log.distributor_failed_count = distributor_failed
         
-        process_log.save(
-            update_fields=[
-                "pharmacy_processed_count", 
-                "pharmacy_failed_count",
-                "distributor_processed_count",
-                "distributor_failed_count",
-                "failed_count", 
-                "failed_files_json", 
-                "status"
-            ]
-        )
+        # Save (status already handled by trigger_process if successful)
+        update_fields = [
+            "pharmacy_processed_count", 
+            "pharmacy_failed_count",
+            "distributor_processed_count",
+            "distributor_failed_count",
+            "failed_count", 
+            "failed_files_json"
+        ]
+        
+        # Only include status if there were errors
+        if ErrorLogs.objects.filter(process_log=process_log).exclude(
+            error_severity=error_severity
+        ).exists():
+            update_fields.append("status")
+        
+        process_log.save(update_fields=update_fields)
+
+        # Clean up local files after S3 upload
+        cleanup_local_process_folder(process_log.name)
 
     except Exception as e:
-        # --- HANDLE EXCEPTION SAFELY ---
         process_log.status = get_processing_status(ProcessingStatusCodes.Failure.value)
         process_log.failed_files_json = json.dumps(failed_files)
         process_log.failed_count = len(failed_files)
@@ -1406,11 +1399,10 @@ def handle_zip_file(file, process_log, obj, pharmacy, is_resubmission=False, pro
         )
 
     finally:
-        # --- CLEAN TEMP FOLDER AND ZIP ---
         remove_dir_recursive(temp_dir)
         if os.path.exists(temp_zip_path):
             os.remove(temp_zip_path)
-
+    
 def cleanup_temp_dir(path):
     """Clean extracted temp directory to avoid collisions."""
     if os.path.exists(path):
@@ -1627,5 +1619,82 @@ def check_Phamacy_column_mappings(
             )
 
     all_valid = not missing_required_columns
-
     return all_valid
+
+def upload_process_folder_to_s3(process_name):
+    """
+    Upload all files in process folder to S3, skip duplicates.
+    Maintains same folder structure as local.
+    """
+    s3_client = get_boto3_client()
+    local_folder = os.path.join(os.getcwd(), settings.AUDIT_FILES_LOCATION, process_name)
+    if not os.path.exists(local_folder):
+        print(f"⚠️ Local folder does not exist: {local_folder}")
+        return
+
+    uploaded_count = 0
+    skipped_count = 0
+
+    for root, dirs, files in os.walk(local_folder):
+        for file_name in files:
+            local_file_path = os.path.join(root, file_name)
+            s3_key = f"{process_name}/{file_name}"
+            
+            # Check if file already exists in S3
+            try:
+                s3_client.head_object(Bucket=settings.AWS_BUCKET, Key=s3_key)
+                print(f"⏭️ Skipping {file_name} (already in S3)")
+                skipped_count += 1
+                continue
+            except ClientError:
+                pass
+            
+            # Upload file to S3
+            try:
+                s3_client.upload_file(local_file_path, settings.AWS_BUCKET, s3_key)
+                print(f"✅ Uploaded {file_name} to S3")
+                uploaded_count += 1
+            except Exception as e:
+                print(f"❌ Failed to upload {file_name}: {e}")
+
+    print(f" Upload complete: {uploaded_count} uploaded, {skipped_count} skipped")
+    
+def cleanup_s3_folder(process_name):
+    """
+    Delete entire S3 folder when process deleted from UI.
+    """
+    s3_client = get_boto3_client()
+    prefix = f"{process_name}/"
+    try:
+        response = s3_client.list_objects_v2(
+            Bucket=settings.AWS_BUCKET,
+            Prefix=prefix
+        )
+        
+        if 'Contents' not in response:
+            print(f"No files found in S3 for process: {process_name}")
+            return
+        
+        objects_to_delete = [{'Key': obj['Key']} for obj in response['Contents']]
+        
+        if objects_to_delete:
+            s3_client.delete_objects(
+                Bucket=settings.AWS_BUCKET,
+                Delete={'Objects': objects_to_delete}
+            )
+            print(f"🗑️ Deleted {len(objects_to_delete)} files from S3: {process_name}")
+
+    except Exception as e:
+        print(f"❌ Error cleaning up S3 folder {process_name}: {e}")
+    
+def cleanup_local_process_folder(process_name):
+            """
+            Clean up local process folder after S3 upload.
+            """
+            local_folder = os.path.join(os.getcwd(), settings.AUDIT_FILES_LOCATION, process_name)
+            if os.path.exists(local_folder):
+                try:
+                    remove_dir_recursive(local_folder)
+                    print(f"🧹 Cleaned up local folder: {process_name}")
+                except Exception as e:
+                    print(f"⚠️ Could not clean local folder {process_name}: {e}")
