@@ -40,6 +40,22 @@ class Pharmacyviewset(CoreViewset):
         "address", "status", "sales_contact", "volume_group"
     ).all()
 
+def get_queryset(self):
+    queryset = super().get_queryset()
+    volume_group = self.request.query_params.get('volume_group')
+    
+    print(f"DEBUG: volume_group param = '{volume_group}'")
+    print(f"DEBUG: query_params = {self.request.query_params}")
+    
+    if volume_group:
+        print(f"DEBUG: Filtering by volume_group_id={volume_group}")
+        queryset = queryset.filter(volume_group_id=volume_group)
+        print(f"DEBUG: Filtered count = {queryset.count()}")
+    else:
+        print(f"DEBUG: No volume_group filter, returning all")
+    
+    return queryset
+
     def create(self, request, *args, **kwargs):
         data = request.data
         if "address" in data:

@@ -2,12 +2,8 @@ from django.conf import settings
 from rest_framework.authtoken.models import Token
 from rest_framework.authentication import get_authorization_header
 from datetime import datetime, timedelta
-import base64
-from rest_framework.response import Response
-from rest_framework import status
+from django.http import JsonResponse
 import pytz
-from django.http import HttpResponseForbidden
-
 
 class UserAuthenticationMiddleware:
     def __init__(self, get_response):
@@ -18,30 +14,21 @@ class UserAuthenticationMiddleware:
         if auth and len(auth) > 1:
             try:
                 if "bearer" in str(auth[0].lower()):
-                    token: Token = Token.objects.get(key=auth[1].decode())
-                    if token:
-                        if token.created + timedelta(
-                            minutes=settings.AUTH_TOKEN_LIFE
-                        ) < datetime.now().astimezone(pytz.UTC):
-                            token.delete()
-                            return HttpResponseForbidden({"Invalid/Expired token"})
-                        request.user = token.user
-                    else:
-                        return HttpResponseForbidden({"Invalid/Expired token"})
-            except Exception as e:
-                return HttpResponseForbidden({"Invalid/Expired token"})
+                    token = Token.objects.get(key=auth[1].decode())
+                    if token.created + timedelta(minutes=settings.AUTH_TOKEN_LIFE) < datetime.now().astimezone(pytz.UTC):
+                        token.delete()
+                        return JsonResponse({"detail": "Invalid/Expired token"}, status=403)
+                    request.user = token.user
+            except Exception:
+                return JsonResponse({"detail": "Invalid/Expired token"}, status=403)
 
-        response = self.get_response(request)
-
-        return response
+        return self.get_response(request)
 
 
-class DisableCSRFMiddleware(object):
-
+class DisableCSRFMiddleware:
     def __init__(self, get_response):
         self.get_response = get_response
 
     def __call__(self, request):
         setattr(request, "_dont_enforce_csrf_checks", True)
-        response = self.get_response(request)
-        return response
+        return self.get_response(request)

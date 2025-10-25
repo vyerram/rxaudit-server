@@ -225,36 +225,28 @@ class ProcessLogHdrviewset(CoreViewset):
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
     def get_queryset(self):
-        queryset = super().get_queryset()
-        request_user = self.request.user
-        
-        if request_user.pharmacy:
-            # Include both:
-            # 1. Logs with ProcessLogDetail entries for this pharmacy
-            # 2. Logs created recently (within last hour) that might not have details yet
-            from django.utils import timezone
-            from datetime import timedelta
+            """
+            Filter queryset based on user permissions
+            """
+            queryset = super().get_queryset()
+            request_user = self.request.user
             
-            recent_cutoff = timezone.now() - timedelta(hours=1)
-            
-            queryset = queryset.filter(
-                Q(process_log_detail_process_log__pharmacy=request_user.pharmacy.id) |
-                Q(created_at__gte=recent_cutoff)
-            ).distinct()
-            
-        elif request_user.volume_group:
-            pharmacies_to_volume_group = Pharmacy.objects.filter(
-                volume_group=request_user.volume_group.id
-            ).values_list("id", flat=True)
-            
-            recent_cutoff = timezone.now() - timedelta(hours=1)
-            
-            queryset = queryset.filter(
-                Q(process_log_detail_process_log__pharmacy__in=pharmacies_to_volume_group) |
-                Q(created_at__gte=recent_cutoff)
-            ).distinct()
-            
-        return queryset
+            if request_user.pharmacy:
+                queryset = queryset.filter(
+                    process_log_detail_process_log__pharmacy=request_user.pharmacy
+                ).distinct()
+                
+            elif request_user.volume_group:
+                pharmacy_ids = list(Pharmacy.objects.filter(
+                    volume_group=request_user.volume_group
+                ).values_list("id", flat=True))
+                
+                if pharmacy_ids:
+                    queryset = queryset.filter(
+                        process_log_detail_process_log__pharmacy__in=pharmacy_ids
+                    ).distinct()
+                
+            return queryset
 
     @action(detail=True, methods=[HTTPMethod.POST])
     def execute(self, request, **kwargs):
