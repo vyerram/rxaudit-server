@@ -1,6 +1,6 @@
 from django.db import models
 from core.models import CoreModel, CoreLookupModel
-from pharmacy.models import Pharmacy, ProcessingStatus, PharmacySoftware
+from pharmacy.models import Pharmacy, ProcessingStatus, PharmacySoftware, VolumeGroup
 
 
 class FileType(CoreLookupModel):
@@ -281,7 +281,8 @@ class DistributorAuditData(CoreModel):
 class FileDBMapping(CoreModel):
     source_col_name = models.CharField(db_column="fmp_source_col_name", max_length=128)
     dest_col_name = models.CharField(db_column="fmp_dest_col_name", max_length=128)
-    date_type = models.CharField(db_column="fmp_date_type", blank=True, null=True)
+    date_type = models.CharField(db_column="fmp_date_type", blank=True, null=True, max_length=128)
+    
     distributor = models.ForeignKey(
         Distributors,
         on_delete=models.PROTECT,
@@ -300,7 +301,6 @@ class FileDBMapping(CoreModel):
         null=True,
         to_field="id",
     )
-
     file_type = models.ForeignKey(
         FileType,
         on_delete=models.PROTECT,
@@ -315,6 +315,17 @@ class FileDBMapping(CoreModel):
         on_delete=models.PROTECT,
         db_column="fmp_pharmacy_software",
         related_name="file_db_mapping_pharmacy_software",
+        blank=True,
+        null=True,
+        to_field="id",
+    )
+    
+    # NEW FIELD FOR VOLUME GROUP LEVEL MAPPINGS
+    volume_group = models.ForeignKey(
+        VolumeGroup,
+        on_delete=models.PROTECT,
+        db_column="fmp_volume_group",
+        related_name="volume_group_file_db_mapping",
         blank=True,
         null=True,
         to_field="id",

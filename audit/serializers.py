@@ -44,11 +44,8 @@ class FileDBMappingDataserializer(CoreSerializer):
         model = models.FileDBMapping
         relations = []
 
-    # def get_distributor(self, obj):
-    #     return super().retrieve_relation_data(obj, "distributor")
-
-    # def get_pharmacy(self, obj):
-    #     return super().retrieve_relation_data(obj, "pharmacy")
+    def get_volume_group(self, obj):
+        return super().retrieve_relation_data(obj, "volume_group")
 
 
 class FileTypeserializer(CoreSerializer):

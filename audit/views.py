@@ -52,9 +52,76 @@ class DistributorAuditDataviewset(CoreViewset):
 class FileDBMappingviewset(CoreViewset):
     serializer_class = serializers.FileDBMappingDataserializer
     queryset = models.FileDBMapping.objects.select_related(
-        "distributor", "pharmacy", "pharmacy_software"
+        "distributor", "pharmacy", "pharmacy_software", "volume_group"
     ).all()
 
+    def get_queryset(self):
+        """
+        Filter mappings based on pharmacy's volume group.
+        Shows: Admin mappings (volume_group=null) + User's pharmacy's volume group mappings
+        """
+        queryset = super().get_queryset()
+        user = self.request.user
+        
+        # Get query parameters
+        pharmacy_software = self.request.query_params.get('pharmacy_software')
+        distributor = self.request.query_params.get('distributor')
+        
+        # Base filter: Always include admin mappings (volume_group=null)
+        filters = Q(volume_group__isnull=True)
+        
+        # Add pharmacy's volume group mappings
+        # This works for BOTH pharmacy users AND volume group users
+        if hasattr(user, 'pharmacy') and user.pharmacy and user.pharmacy.volume_group:
+            filters |= Q(volume_group=user.pharmacy.volume_group)
+        
+        queryset = queryset.filter(filters)
+        
+        # Apply additional filters
+        if pharmacy_software:
+            queryset = queryset.filter(pharmacy_software_id=pharmacy_software)
+        if distributor:
+            queryset = queryset.filter(distributor_id=distributor)
+            
+        return queryset
+
+    def perform_create(self, serializer):
+        """
+        Auto-assign volume_group from user's pharmacy when creating mappings.
+        Admin (no pharmacy) → volume_group=null (visible to all)
+        User with pharmacy → volume_group=pharmacy's volume group
+        """
+        user = self.request.user
+        volume_group = None
+        
+        # Get volume group from user's pharmacy
+        if hasattr(user, 'pharmacy') and user.pharmacy and user.pharmacy.volume_group:
+            volume_group = user.pharmacy.volume_group
+        
+        serializer.save(volume_group=volume_group)
+
+    def perform_update(self, serializer):
+        """
+        Ensure users can only update mappings from their pharmacy's volume group.
+        Admins (no pharmacy) can update all mappings.
+        """
+        user = self.request.user
+        instance = self.get_object()
+        
+        # Only validate if updating a volume group mapping
+        if instance.volume_group:
+            # Get user's pharmacy's volume group
+            user_volume_group = None
+            if hasattr(user, 'pharmacy') and user.pharmacy and user.pharmacy.volume_group:
+                user_volume_group = user.pharmacy.volume_group
+            
+            # Check permission
+            if instance.volume_group != user_volume_group:
+                from rest_framework.exceptions import PermissionDenied
+                raise PermissionDenied("Cannot modify mappings from other volume groups")
+        
+        serializer.save()
+    
     @action(detail=False, methods=[HTTPMethod.POST])
     def get_file_columns(self, request):
         try:
