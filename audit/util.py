@@ -455,16 +455,38 @@ class ProcessAuditData:
         }
 
     def find_header_row(self, df):
-        if all(item in df.columns for item in self.col_mapping.keys()):
+        """
+        Find the row index where headers are located.
+        When multiple source columns map to the same destination (e.g., "NDC", "NDC/UPC", "NDC Number" → "dad_ndc"),
+        we need at least ONE of each destination's sources to exist, not ALL sources.
+        """
+        # Group sources by destination
+        dest_to_sources = defaultdict(list)
+        for src, dest in self.col_mapping.items():
+            dest_to_sources[dest].append(src)
+
+        # Check if at least one source for each destination exists in columns
+        def has_all_destinations(cols):
+            for dest, sources in dest_to_sources.items():
+                # Check if ANY of the source columns for this destination exist
+                if not any(flexible_column_match(src, cols) for src in sources):
+                    return False
+            return True
+
+        # Check if headers are in first row
+        if has_all_destinations(list(df.columns)):
             return 0
+
+        # Check subsequent rows
         for i, row in df.iterrows():
-            if all(item in row.values for item in self.col_mapping.keys()):
+            if has_all_destinations(list(row.values)):
                 return i + 1
+
         return 0
 
     def find_end_row(self, df, header_row):
         end_row_index = None
-        ndc_col = self.get_src_size_col("pad_ndc")
+        ndc_col = self.get_src_size_col("pad_ndc", df)
         for i, row in df[header_row - 1 :].iterrows():
             if all(
                 item == "" or pd.isna(item) or item is None or item == 0
@@ -552,10 +574,28 @@ class ProcessAuditData:
                 ).values("source_col_name", "dest_col_name")
             )
 
-    def get_src_size_col(self, dest_col):
-        for src, dest in self.col_mapping.items():
-            if dest == dest_col:
-                return src
+    def get_src_size_col(self, dest_col, df=None):
+        """
+        Get the source column name that maps to the given destination column.
+        If df is provided, returns the source column that actually exists in the dataframe.
+        If df is not provided or no match is found, returns the first mapping.
+        """
+        matching_sources = [src for src, dest in self.col_mapping.items() if dest == dest_col]
+
+        if not matching_sources:
+            return None
+
+        # If dataframe provided, find which source column actually exists
+        if df is not None:
+            df_columns = list(df.columns)
+            for src in matching_sources:
+                # Use flexible matching to find the column
+                matched_col = flexible_column_match(src, df_columns)
+                if matched_col:
+                    return matched_col
+
+        # Fallback: return first match
+        return matching_sources[0]
 
     def get_file_headers(self, file_location):
         name, extension = os.path.splitext(file_location)
@@ -601,12 +641,12 @@ class ProcessAuditData:
     def validate_file(self, file_location, distributor, pharmacy):
         if pharmacy and not distributor:
             data_frame = self.read_file(file_location)
-            if (data_frame[self.get_src_size_col("pad_size")] == 0).any():
+            if (data_frame[self.get_src_size_col("pad_size", data_frame)] == 0).any():
                 df_filtered = data_frame[
-                    data_frame[self.get_src_size_col("pad_size")] == 0
+                    data_frame[self.get_src_size_col("pad_size", data_frame)] == 0
                 ]
                 invalid_ndc = ",".join(
-                    [str(i) for i in df_filtered[self.get_src_size_col("pad_ndc")]]
+                    [str(i) for i in df_filtered[self.get_src_size_col("pad_ndc", data_frame)]]
                 )
                 return False, invalid_ndc
 
@@ -1459,26 +1499,79 @@ def log_error(
             created_by=created_by,
         )
         
-          # --- Also store failed filenames in ProcessLogHdr ---
-        if process_log and failed_filename:
+        # --- Also store failed filenames in ProcessLogHdr ---
+        if process_log:
             try:
                 plog = ProcessLogHdr.objects.get(pk=process_log.id)
-                existing = []
-                if plog.failed_files_json:
-                    try:
-                        existing = json.loads(plog.failed_files_json)
-                        if not isinstance(existing, list):
-                            existing = []
-                    except Exception:
-                        existing = []
 
-                if failed_filename not in existing:
-                    existing.append(failed_filename)
-                    plog.failed_files_json = json.dumps(existing)
+                # Update failed files list if we detected a filename
+                if failed_filename:
+                    existing = []
+                    if plog.failed_files_json:
+                        try:
+                            existing = json.loads(plog.failed_files_json)
+                            if not isinstance(existing, list):
+                                existing = []
+                        except Exception:
+                            existing = []
+
+                    if failed_filename not in existing:
+                        existing.append(failed_filename)
+                        plog.failed_files_json = json.dumps(existing)
+
+                # Determine if this is a pharmacy or distributor error
+                # Check multiple indicators: filename, error message, and error location
+                is_pharmacy_error = False
+                is_distributor_error = False
+
+                # 1. Check filename if available
+                if failed_filename:
+                    filename_lower = failed_filename.lower()
+                    # Common pharmacy file patterns
+                    if any(pattern in filename_lower for pattern in ['pharmacy', 'rx', 'pharm', 'dispensing', 'prescription']):
+                        is_pharmacy_error = True
+                    # Common distributor file patterns
+                    elif any(pattern in filename_lower for pattern in ['distributor', 'dist', 'wholesaler', 'purchase', 'invoice']):
+                        is_distributor_error = True
+
+                # 2. Check error message for file context if filename check didn't work
+                if not is_pharmacy_error and not is_distributor_error:
+                    error_msg_lower = error_message.lower()
+                    if any(pattern in error_msg_lower for pattern in ['pharmacy', 'rx', 'dispensing', 'prescription']):
+                        is_pharmacy_error = True
+                    elif any(pattern in error_msg_lower for pattern in ['distributor', 'dist', 'wholesaler', 'purchase', 'invoice']):
+                        is_distributor_error = True
+
+                # 3. Fall back to error_location as last resort
+                if not is_pharmacy_error and not is_distributor_error and error_location:
+                    error_loc_lower = error_location.lower()
+                    if 'pharmacy' in error_loc_lower or 'rx' in error_loc_lower:
+                        is_pharmacy_error = True
+                    elif 'distributor' in error_loc_lower:
+                        is_distributor_error = True
+
+                update_fields = []
+
+                # Increment the appropriate failed count
+                if is_pharmacy_error:
+                    plog.pharmacy_failed_count = (plog.pharmacy_failed_count or 0) + 1
+                    update_fields.append("pharmacy_failed_count")
+                elif is_distributor_error:
+                    plog.distributor_failed_count = (plog.distributor_failed_count or 0) + 1
+                    update_fields.append("distributor_failed_count")
+                else:
+                    # If we can't determine, increment legacy failed_count
                     plog.failed_count = (plog.failed_count or 0) + 1
-                    plog.save(update_fields=["failed_files_json", "failed_count"])
+                    update_fields.append("failed_count")
+
+                if failed_filename and "failed_files_json" not in update_fields:
+                    update_fields.append("failed_files_json")
+
+                if update_fields:
+                    plog.save(update_fields=update_fields)
+
             except Exception as inner_ex:
-                print(f"Warning: could not update failed_files_json: {inner_ex}")
+                print(f"Warning: could not update failed counts: {inner_ex}")
 
     except Exception as e:
 
@@ -1494,6 +1587,29 @@ def extract_column_names(file_path, sheet_name=0):
     column_names = list(df.columns)
 
     return column_names
+
+def flexible_column_match(expected_col_name, actual_columns):
+    """
+    Match a column name against a list of actual column names with case-insensitive comparison.
+
+    The FileDBMapping table should contain all valid variations (e.g., "NDC", "NDC/UPC", "NDC Number"),
+    so we only need case-insensitive exact matching here.
+
+    Returns the matching column name from actual_columns, or None if no match found.
+    """
+    if not expected_col_name or not actual_columns:
+        return None
+
+    # Normalize the expected column name (strip whitespace, lowercase)
+    expected_normalized = expected_col_name.strip().lower()
+
+    # Case-insensitive exact match
+    for col in actual_columns:
+        if col.strip().lower() == expected_normalized:
+            return col
+
+    return None
+
 
 def check_column_mappings(extrated_file, distributor, columns, process_log):
     mappings = FileDBMapping.objects.filter(distributor=distributor).values(
@@ -1511,7 +1627,9 @@ def check_column_mappings(extrated_file, distributor, columns, process_log):
     for mapping in mappings:
         source_col_name = mapping["source_col_name"]
         dest_col_name = mapping["dest_col_name"]
-        if source_col_name in columns:
+        # Use flexible column matching instead of exact match
+        matched_col = flexible_column_match(source_col_name, columns)
+        if matched_col:
             grouped_destinations[dest_col_name] = True
     if not grouped_destinations.get("dad_date", False):
         log_error(
@@ -1573,7 +1691,9 @@ def check_Phamacy_column_mappings(
         dest_col_name = mapping["dest_col_name"]
         dest_to_source_map[dest_col_name].append(source_col_name)
 
-        if source_col_name in columns:
+        # Use flexible column matching instead of exact match
+        matched_col = flexible_column_match(source_col_name, columns)
+        if matched_col:
             grouped_destinations[dest_col_name] = True
     missing_required_columns = [
         dest for dest in required_columns if not grouped_destinations.get(dest, False)

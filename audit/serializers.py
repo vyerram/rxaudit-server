@@ -37,8 +37,7 @@ class DistributorAuditDataserializer(CoreSerializer):
 
 
 class FileDBMappingDataserializer(CoreSerializer):
-    # distributor = serializers.SerializerMethodField()
-    # pharmacy = serializers.SerializerMethodField()
+    scope = serializers.SerializerMethodField()
 
     class Meta(CoreSerializer.Meta):
         model = models.FileDBMapping
@@ -46,6 +45,12 @@ class FileDBMappingDataserializer(CoreSerializer):
 
     def get_volume_group(self, obj):
         return super().retrieve_relation_data(obj, "volume_group")
+
+    def get_scope(self, obj):
+        """
+        Distinguish admin-defined mappings (shared) from volume-group overrides.
+        """
+        return "admin" if obj.volume_group_id is None else "volume_group"
 
 
 class FileTypeserializer(CoreSerializer):

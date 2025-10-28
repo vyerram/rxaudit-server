@@ -84,7 +84,6 @@ class CoreSerializer(QueryFieldsMixin, ModelSerializer):
                 )
                 if serializer_class:
                     if model_relation.many_to_many or model_relation.one_to_many:
-                        # More and more I see it this logic is seeming bull shit. Need to come up with better logic
                         serializer_data = serializer_class(getattr(obj, relation).all())
                         return serializer_data.data
                     elif model_relation.one_to_one or model_relation.many_to_one:
