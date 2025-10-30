@@ -50,6 +50,7 @@ DJANGO_APPS = [
     "rest_framework_swagger",
     "drf_yasg",
     "django_compiler",
+    "django_celery_results",
 ]
 
 INSTALLED_APPS = DJANGO_APPS + BASE_APPS + SYSTEM_APPS
@@ -126,7 +127,22 @@ LOGGING = {
         "django": {
             "handlers": ["file", "console"],
             "propagate": True,
-        }
+        },
+        "audit": {
+            "handlers": ["file", "console"],
+            "level": "INFO",
+            "propagate": False,
+        },
+        "pharmacy": {
+            "handlers": ["file", "console"],
+            "level": "INFO",
+            "propagate": False,
+        },
+        "core": {
+            "handlers": ["file", "console"],
+            "level": "INFO",
+            "propagate": False,
+        },
     },
     "handlers": {
         "console": {
@@ -154,7 +170,7 @@ DATABASES = {
         "PASSWORD": DB_CONN.password,
         "HOST": DB_CONN.hostname,
         "PORT": DB_CONN.port,
-        "CONN_MAX_AGE": 300,
+        "CONN_MAX_AGE": 600,  # Increased from 300 to 600 for better connection reuse
         "CONN_HEALTH_CHECKS": True,
         "OPTIONS": {
             "connect_timeout": 5,
@@ -314,3 +330,20 @@ PDF_GENERATION_LOCATION = "pdf_generations"
 PDF_TEMPLATES = "pdf_templates"
 AUDIT_FILES_LOCATION = "audit_files"
 CLEAN_FILES_LOCATION = "clean_files"
+
+# Performance Configuration
+# Thread pool for background file processing tasks
+# Adjust based on server CPU cores (recommended: 2x CPU cores)
+BACKGROUND_TASK_WORKERS = int(os.environ.get("BACKGROUND_TASK_WORKERS", "8"))
+
+# Celery Configuration
+CELERY_BROKER_URL = os.environ.get("CELERY_BROKER_URL", "redis://localhost:6379/0")
+CELERY_RESULT_BACKEND = "django-db"
+CELERY_CACHE_BACKEND = "default"
+CELERY_ACCEPT_CONTENT = ["json"]
+CELERY_TASK_SERIALIZER = "json"
+CELERY_RESULT_SERIALIZER = "json"
+CELERY_TIMEZONE = TIME_ZONE
+CELERY_TASK_TRACK_STARTED = True
+CELERY_TASK_TIME_LIMIT = 30 * 60  # 30 minutes
+CELERY_RESULT_EXTENDED = True

@@ -31,7 +31,13 @@ from rest_framework.decorators import action
 from person import models as person_models, serializers as person_serializers
 from http import HTTPMethod
 from django.core.mail import send_mail
-import threading
+import logging
+from concurrent.futures import ThreadPoolExecutor
+
+logger = logging.getLogger(__name__)
+
+# Thread pool for background tasks (configurable pool size)
+executor = ThreadPoolExecutor(max_workers=settings.BACKGROUND_TASK_WORKERS if hasattr(settings, 'BACKGROUND_TASK_WORKERS') else 4)
 
 
 class Pharmacyviewset(CoreViewset):
@@ -44,15 +50,9 @@ class Pharmacyviewset(CoreViewset):
         queryset = super().get_queryset()
         volume_group = self.request.query_params.get('volume_group')
 
-        print(f"DEBUG: volume_group param = '{volume_group}'")
-        print(f"DEBUG: query_params = {self.request.query_params}")
-
         if volume_group:
-            print(f"DEBUG: Filtering by volume_group_id={volume_group}")
+            logger.debug(f"Filtering pharmacies by volume_group_id={volume_group}")
             queryset = queryset.filter(volume_group_id=volume_group)
-            print(f"DEBUG: Filtered count = {queryset.count()}")
-        else:
-            print(f"DEBUG: No volume_group filter, returning all")
 
         return queryset
 
@@ -171,6 +171,7 @@ class Pharmacyviewset(CoreViewset):
 
     @action(methods=[HTTPMethod.GET], detail=False)
     def get_data_campus_master(self, request):
+        # Optimize aggregation query by selecting only needed fields
         aggregate_values = [
             "source_compliance_pct_base_member",
             "source_compliance_pct_new_member",
@@ -284,12 +285,10 @@ def trigger_process_email(request, **kwargs):
                 status=get_processing_status(ProcessingStatusCodes.Inprogress.value),
             )
             file_process_logs.save()
-            t = threading.Thread(
-                target=process_emails,
-                args=[subject, full_file_name, file_name, file_process_logs],
-                daemon=True,
+            executor.submit(
+                process_emails,
+                subject, full_file_name, file_name, file_process_logs
             )
-            t.start()
         return Response(data={"status": "success"}, status=status.HTTP_200_OK)
     except Exception as e:
         file_process_logs.status = get_processing_status(

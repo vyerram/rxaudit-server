@@ -18,7 +18,9 @@ from .util import batch_process_files
 import os
 from django.conf import settings
 from rest_framework.response import Response
-import threading
+import logging
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 import pandas as pd
 from core.utils import download_file
 from django.forms.models import model_to_dict
@@ -31,6 +33,13 @@ from core.utils import get_boto3_client
 import io
 from django.db.models import Q
 from rest_framework.exceptions import PermissionDenied
+from .tasks import process_zip_file_task
+import tempfile
+
+logger = logging.getLogger(__name__)
+
+# Thread pool for background tasks (configurable pool size) - Deprecated, use Celery
+executor = ThreadPoolExecutor(max_workers=settings.BACKGROUND_TASK_WORKERS if hasattr(settings, 'BACKGROUND_TASK_WORKERS') else 4)
 
 
 class PharmacyAuditDataviewset(CoreViewset):
@@ -101,9 +110,10 @@ class FileDBMappingviewset(CoreViewset):
 
         return False
 
+    @lru_cache(maxsize=128)
     def _get_user_context(self):
         """
-        Get user context with role type and relevant IDs.
+        Get user context with role type and relevant IDs (cached).
         Returns dict with:
             - user_type: 'superuser', 'volume_group', or 'pharmacy'
             - pharmacy_id: pharmacy UUID if user is pharmacy user
@@ -114,18 +124,13 @@ class FileDBMappingviewset(CoreViewset):
         even if they have superuser permissions.
         """
         user = self.request.user
-        print(f"\n========== _get_user_context ==========")
-        print(f"User: {user.username if user.is_authenticated else 'Anonymous'}")
-        print(f"is_authenticated: {user.is_authenticated}")
-        print(f"is_superuser: {getattr(user, 'is_superuser', None)}")
+        logger.debug(f"Getting user context for {user.username if user.is_authenticated else 'Anonymous'}")
 
         # Get pharmacy ID first (highest priority)
         pharmacy_id = getattr(user, "pharmacy_id", None)
         if not pharmacy_id:
             pharmacy = getattr(user, "pharmacy", None)
             pharmacy_id = getattr(pharmacy, "id", None)
-
-        print(f"pharmacy_id: {pharmacy_id}")
 
         # If user has pharmacy, they're a pharmacy user (highest priority)
         if pharmacy_id:
@@ -163,11 +168,8 @@ class FileDBMappingviewset(CoreViewset):
 
         # Check for user-assigned volume group (second priority)
         volume_group_id = getattr(user, "volume_group_id", None)
-        print(f"volume_group_id from user: {volume_group_id}")
 
         if volume_group_id:
-            print(f"✓ RESULT: volume_group user with VG={volume_group_id}")
-            print("=" * 40)
             return {
                 "user_type": "volume_group",
                 "pharmacy_id": None,
@@ -176,8 +178,6 @@ class FileDBMappingviewset(CoreViewset):
 
         # Only treat as superuser if no pharmacy AND no volume_group assigned
         if self._is_superuser():
-            print("✓ RESULT: superuser (no pharmacy/VG assigned)")
-            print("=" * 40)
             return {
                 "user_type": "superuser",
                 "pharmacy_id": None,
@@ -185,8 +185,6 @@ class FileDBMappingviewset(CoreViewset):
             }
 
         # Fallback: regular user with no special permissions
-        print("✓ RESULT: fallback to superuser (no permissions)")
-        print("=" * 40)
         return {
             "user_type": "superuser",  # Default to superuser for safety
             "pharmacy_id": None,
@@ -207,13 +205,10 @@ class FileDBMappingviewset(CoreViewset):
         pharmacy_software = self.request.query_params.get('pharmacy_software')
         distributor = self.request.query_params.get('distributor')
 
-        print(f"\n========== get_queryset ==========")
-        print(f"User context: {user_context}")
-        print(f"Query params: pharmacy_software={pharmacy_software}, distributor={distributor}")
+        logger.debug(f"User context: {user_context}, params: pharmacy_software={pharmacy_software}, distributor={distributor}")
 
         # SuperUser sees everything - no filtering
         if user_context["user_type"] == "superuser":
-            print("✓ SuperUser - No filtering applied")
             pass  # No filtering, return all
         elif user_context["user_type"] == "volume_group":
             # Volume Group users see:
@@ -225,7 +220,6 @@ class FileDBMappingviewset(CoreViewset):
             if volume_group_id:
                 # Only VG-level mappings, not pharmacy-specific ones
                 filters |= Q(volume_group_id=volume_group_id, pharmacy__isnull=True)
-                print(f"✓ Volume Group User - Filter: Admin OR (VG={volume_group_id} AND pharmacy=null)")
 
             queryset = queryset.filter(filters)
         elif user_context["user_type"] == "pharmacy":
@@ -241,12 +235,10 @@ class FileDBMappingviewset(CoreViewset):
             if pharmacy_id:
                 # Their specific pharmacy mappings
                 filters |= Q(pharmacy_id=pharmacy_id)
-                print(f"✓ Pharmacy User - Adding filter: pharmacy={pharmacy_id}")
 
             if volume_group_id:
                 # VG-level mappings (not pharmacy-specific)
                 filters |= Q(volume_group_id=volume_group_id, pharmacy__isnull=True)
-                print(f"✓ Pharmacy User - Adding filter: VG={volume_group_id} AND pharmacy=null")
 
             queryset = queryset.filter(filters)
 
@@ -255,41 +247,6 @@ class FileDBMappingviewset(CoreViewset):
             queryset = queryset.filter(pharmacy_software_id=pharmacy_software)
         if distributor:
             queryset = queryset.filter(distributor_id=distributor)
-
-        print(f"Final queryset count: {queryset.count()}")
-
-        # Print the actual SQL query
-        from django.db import connection
-        print(f"\nSQL Query:\n{queryset.query}\n")
-
-        # Group mappings by their scope for analysis
-        admin_mappings = []
-        vg_mappings = []
-        pharmacy_mappings = []
-
-        for mapping in queryset:
-            if mapping.volume_group_id is None and mapping.pharmacy_id is None:
-                admin_mappings.append(mapping)
-            elif mapping.pharmacy_id is not None:
-                pharmacy_mappings.append(mapping)
-            else:
-                vg_mappings.append(mapping)
-
-        print(f"\nMapping breakdown:")
-        print(f"  Admin mappings (VG=null, pharmacy=null): {len(admin_mappings)}")
-        print(f"  VG-level mappings (VG=set, pharmacy=null): {len(vg_mappings)}")
-        print(f"  Pharmacy mappings (pharmacy=set): {len(pharmacy_mappings)}")
-
-        if pharmacy_mappings:
-            print(f"\n⚠️  WARNING: Found {len(pharmacy_mappings)} pharmacy-specific mappings!")
-            print("  First 5 pharmacy mappings:")
-            for i, mapping in enumerate(pharmacy_mappings[:5], 1):
-                print(f"    {i}. id={str(mapping.id)[:8]}..., VG={str(mapping.volume_group_id)[:8]}, pharmacy={str(mapping.pharmacy_id)[:8]}, source={mapping.source_col_name}, dest={mapping.dest_col_name}")
-
-        print("\nFirst 10 mappings overall:")
-        for i, mapping in enumerate(queryset[:10], 1):
-            print(f"  {i}. id={str(mapping.id)[:8]}..., VG={str(mapping.volume_group_id)[:8] if mapping.volume_group_id else 'NULL'}, pharmacy={str(mapping.pharmacy_id)[:8] if mapping.pharmacy_id else 'NULL'}, source={mapping.source_col_name}, dest={mapping.dest_col_name}")
-        print("=" * 40)
 
         return queryset
 
@@ -300,16 +257,11 @@ class FileDBMappingviewset(CoreViewset):
         - Volume Group User: volume_group=user's VG, pharmacy=null (shared across VG)
         - Pharmacy User: volume_group=pharmacy's VG, pharmacy=user's pharmacy
         """
-        print("\n" + "=" * 60)
-        print("========== PERFORM_CREATE CALLED ==========")
-        print("=" * 60)
-
         user_context = self._get_user_context()
         validated = serializer.validated_data
         record_list = validated if isinstance(validated, list) else [validated]
 
-        print(f"User context in perform_create: {user_context}")
-        print(f"Number of records to create: {len(record_list) if isinstance(record_list, list) else 1}")
+        logger.info(f"Creating mappings: user_type={user_context['user_type']}, count={len(record_list) if isinstance(record_list, list) else 1}")
 
         # Identify the scope (pharmacy software / distributor) being overwritten
         scope_keys = set()
@@ -373,9 +325,6 @@ class FileDBMappingviewset(CoreViewset):
             user = self.request.user if self.request.user.is_authenticated else None
             instances = []
 
-            import logging
-            logger = logging.getLogger(__name__)
-
             for record in record_list:
                 payload = dict(record)
                 # Remove volume_group and pharmacy from payload to set them explicitly
@@ -408,10 +357,7 @@ class FileDBMappingviewset(CoreViewset):
                     payload.setdefault("created_by", user)
                     payload.setdefault("updated_by", user)
 
-                print(f"Creating mapping with user_type={user_context['user_type']}, volume_group_id={payload.get('volume_group_id')}, pharmacy_id={payload.get('pharmacy_id')}, dest_col={payload.get('dest_col_name')}")
-
                 instance = model_cls.objects.create(**payload)
-                print(f"✓ Created mapping: id={str(instance.id)[:8]}..., volume_group={str(instance.volume_group_id)[:8] if instance.volume_group_id else 'NULL'}, pharmacy={str(instance.pharmacy_id)[:8] if instance.pharmacy_id else 'NULL'}")
                 instances.append(instance)
 
         serializer.instance = instances if serializer.many else instances[0]
@@ -646,7 +592,7 @@ class ProcessLogHdrviewset(CoreViewset):
             # Admin users can access any process log, even if not in their filtered queryset
             # This is already handled by get_queryset() but we explicitly note it here
             process_log = self.get_object()
-            pharmacy = request.data.get("pharmacy")
+            pharmacy_id = request.data.get("pharmacy")
 
             process_folder = os.path.join(settings.AUDIT_FILES_LOCATION, process_log.name)
             os.makedirs(process_folder, exist_ok=True)
@@ -669,15 +615,23 @@ class ProcessLogHdrviewset(CoreViewset):
                 for f in uploaded_files
             )
 
+            # Save file to temp location for Celery task
+            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.zip')
+
             if is_zip:
                 # Take the first ZIP
                 zip_file = next(f for f in uploaded_files if f.name.endswith(".zip"))
-                t = threading.Thread(
-                    target=handle_zip_file,
-                    args=[zip_file, process_log, process_log, pharmacy, True],
-                    daemon=True,
+                temp_file.write(zip_file.read())
+                temp_file.close()
+
+                # Trigger Celery task
+                process_zip_file_task.delay(
+                    temp_file.name,
+                    process_log.id,
+                    process_log.id,
+                    pharmacy_id,
+                    True
                 )
-                t.start()
                 return Response(
                     {"message": "Uploaded ZIP accepted. Reprocessing started."},
                     status=status.HTTP_200_OK,
@@ -688,14 +642,18 @@ class ProcessLogHdrviewset(CoreViewset):
             with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
                 for f in uploaded_files:
                     zf.writestr(f.name, f.read())
-            zip_buffer.seek(0)
-            
-            t = threading.Thread(
-                target=handle_zip_file,
-                args=[zip_buffer, process_log, process_log, pharmacy, True],
-                daemon=True,
+
+            temp_file.write(zip_buffer.getvalue())
+            temp_file.close()
+
+            # Trigger Celery task
+            process_zip_file_task.delay(
+                temp_file.name,
+                process_log.id,
+                process_log.id,
+                pharmacy_id,
+                True
             )
-            t.start()
             return Response(
                 {"message": f"Uploaded {len(uploaded_files)} files reprocessing started."},
                 status=status.HTTP_200_OK,
@@ -710,6 +668,54 @@ class ProcessLogHdrviewset(CoreViewset):
                 error_location="reprocess_failed",
             )
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=[HTTPMethod.GET])
+    def task_status(self, request, pk):
+        """
+        Check the Celery task status for a process log.
+        Returns the current status of the background task processing.
+        """
+        from celery.result import AsyncResult
+        from django_celery_results.models import TaskResult
+
+        try:
+            process_log = models.ProcessLogHdr.objects.get(id=pk)
+
+            # Find the most recent task for this process log
+            recent_task = TaskResult.objects.filter(
+                task_name="audit.process_zip_file"
+            ).order_by("-date_created").first()
+
+            if not recent_task:
+                return Response({
+                    "status": "NO_TASK",
+                    "message": "No background task found for this process",
+                    "process_status": process_log.status.description if process_log.status else "Unknown"
+                })
+
+            # Get task result details
+            task_result = AsyncResult(recent_task.task_id)
+
+            return Response({
+                "task_id": recent_task.task_id,
+                "status": recent_task.status,  # PENDING, STARTED, SUCCESS, FAILURE, RETRY
+                "result": recent_task.result,
+                "date_created": recent_task.date_created,
+                "date_done": recent_task.date_done,
+                "process_status": process_log.status.description if process_log.status else "Unknown",
+                "process_log_id": process_log.id
+            })
+
+        except models.ProcessLogHdr.DoesNotExist:
+            return Response(
+                {"error": f"ProcessLog with ID {pk} does not exist"},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        except Exception as e:
+            return Response(
+                {"error": str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
 
     def get_queryset(self):
             """
@@ -760,12 +766,10 @@ class ProcessLogHdrviewset(CoreViewset):
             obj.status = get_processing_status(ProcessingStatusCodes.Inprogress.value)
             obj.save()
             process_audit_data = ProcessAuditData()
-            t = threading.Thread(
-                target=process_audit_data.trigger_process,
-                args=[obj],
-                daemon=True,
+            executor.submit(
+                process_audit_data.trigger_process,
+                obj
             )
-            t.start()
             return Response(
                 "Triggered process execution, check this space in few minutes"
             )
@@ -779,18 +783,50 @@ class ProcessLogHdrviewset(CoreViewset):
 
     def destroy(self, request, *args, **kwargs):
         instance = self.get_object()
-        
-        # Clean up S3 files before deleting DB records
-        from .util import cleanup_s3_folder
-        cleanup_s3_folder(instance.name)
-        
+
+        # Revoke any running Celery tasks for this process
+        from celery import current_app
+        from django_celery_results.models import TaskResult
+
+        active_tasks = TaskResult.objects.filter(
+            task_name="audit.process_zip_file",
+            status__in=["PENDING", "STARTED"]
+        ).order_by('-date_created')
+
+        for task in active_tasks:
+            try:
+                current_app.control.revoke(task.task_id, terminate=True, signal='SIGKILL')
+                logger.info(f"Revoked Celery task {task.task_id} for process {instance.id}")
+            except Exception as e:
+                logger.warning(f"Failed to revoke task {task.task_id}: {e}")
+
+        # Clear Redis cache for this process
+        from django.core.cache import cache
+        cache_keys = [
+            f"process_{instance.id}_*",
+            f"pharmacy_{instance.id}",
+        ]
+        for key in cache_keys:
+            try:
+                cache.delete(key)
+            except Exception as e:
+                logger.warning(f"Failed to clear cache key {key}: {e}")
+
+        # Clean up local temp_files and audit_files folders (keep S3 files)
+        from .util import remove_dir_recursive
+        temp_dir = os.path.join(os.getcwd(), "temp_files", f"process_{instance.id}")
+        audit_dir = os.path.join(os.getcwd(), settings.AUDIT_FILES_LOCATION, instance.name)
+
+        remove_dir_recursive(temp_dir)
+        remove_dir_recursive(audit_dir)
+
         # Delete related records
         instance.process_log_detail_process_log.all().delete()
         instance.pharmacy_process_log.all().delete()
         instance.distributor_process_log.all().delete()
         instance.error_log_process_log.all().delete()
-        instance.delete()   
-         
+        instance.delete()
+
         return Response(status=status.HTTP_204_NO_CONTENT)
     
     @action(detail=True, methods=[HTTPMethod.GET])
@@ -860,6 +896,8 @@ class ProcessLogHdrviewset(CoreViewset):
             data = request.data
             uploaded_files = request.FILES.getlist("file")
 
+            logger.info(f"Received pharmacy value: {data.get('pharmacy')} (type: {type(data.get('pharmacy'))})")
+
             if not uploaded_files:
                 raise Exception("No files provided")
             
@@ -873,32 +911,39 @@ class ProcessLogHdrviewset(CoreViewset):
                     zip_file = uploaded_file
                     break
 
+            # Save file to temp location for Celery task
+            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.zip')
+
             if is_zip:
-                t = threading.Thread(
-                    target=handle_zip_file,
-                    args=[
-                        zip_file,
-                        process_log,
-                        obj,
-                        data.get("pharmacy"),
-                        is_resubmission,
-                    ],
-                    daemon=True,
+                temp_file.write(zip_file.read())
+                temp_file.close()
+
+                # Trigger Celery task
+                process_zip_file_task.delay(
+                    temp_file.name,
+                    process_log.id,
+                    obj.id,
+                    data.get("pharmacy"),
+                    is_resubmission
                 )
-                t.start()
             else:
                 zip_buffer = io.BytesIO()
                 with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
                     for uploaded_file in uploaded_files:
                         zip_file.writestr(uploaded_file.name, uploaded_file.read())
-                zip_buffer.seek(0)
+
+                temp_file.write(zip_buffer.getvalue())
+                temp_file.close()
+
                 pharmacy = data.get("pharmacy")
-                t = threading.Thread(
-                    target=handle_zip_file,
-                    args=[zip_buffer, process_log, obj, pharmacy, is_resubmission],
-                    daemon=True,
+                # Trigger Celery task
+                process_zip_file_task.delay(
+                    temp_file.name,
+                    process_log.id,
+                    obj.id,
+                    pharmacy,
+                    is_resubmission
                 )
-                t.start()
 
             return Response({"message": "Process Triggered"}, status=status.HTTP_200_OK)
 
@@ -914,6 +959,7 @@ class ProcessLogHdrviewset(CoreViewset):
                 status=status.HTTP_404_NOT_FOUND,
             )
         except Exception as e:
+            logger.error(f"automation_process error for pk={pk}: {str(e)}", exc_info=True)
             return Response(
                 {"error": str(e)},
                 status=status.HTTP_400_BAD_REQUEST,
@@ -1123,12 +1169,10 @@ class CleanFilesLogviewset(CoreViewset):
             )
             fs = FileSystemStorage(file_location)
             fs.save(file_name, ContentFile(file.read()))
-            t = threading.Thread(
-                target=batch_process_files,
-                args=[file_location, file_name, file, obj, output_file_name],
-                daemon=True,
+            executor.submit(
+                batch_process_files,
+                file_location, file_name, file, obj, output_file_name
             )
-            t.start()
             return Response({"message": "Process Triggered"}, status=status.HTTP_200_OK)
         except Exception as e:
             return HttpResponseServerError("File cleaning failed due to: " + str(e))

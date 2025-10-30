@@ -1,5 +1,15 @@
 version: '3.8'
 services:
+  redis:
+    image: redis:7-alpine
+    container_name: rxaudit-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    restart: unless-stopped
+
   web:
     container_name: rxwftest-dev-ec2-backend-ecr
     image: public.ecr.aws/i5b2u7r3/rxwftest-dev-ec2-backend-ecr:latest
@@ -12,3 +22,22 @@ services:
       - 8000
     env_file:
       - ./.env
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  celery:
+    container_name: rxaudit-celery-worker
+    image: public.ecr.aws/i5b2u7r3/rxwftest-dev-ec2-backend-ecr:latest
+    command: celery -A core worker --loglevel=info --concurrency=4
+    volumes:
+      - .:/usr/src/app/
+    env_file:
+      - ./.env
+    depends_on:
+      - redis
+      - web
+    restart: unless-stopped
+
+volumes:
+  redis_data:

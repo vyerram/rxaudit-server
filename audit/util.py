@@ -1,6 +1,7 @@
 import pandas as pd
 import json
 import traceback
+import logging
 from audit.models import (
     FileDBMapping,
     PharmacyAuditData,
@@ -9,9 +10,11 @@ from audit.models import (
     ErrorSeverity, ErrorLogs, ProcessLogHdr
 )
 from collections import defaultdict
-from audit.models import ErrorLogs, ErrorSeverity
 from pharmacy.models import Pharmacy
-from threading import Thread
+from django.core.cache import cache
+from functools import lru_cache
+
+logger = logging.getLogger(__name__)
 from core.utils import (
     download_file,
     get_default_value_if_null,
@@ -40,7 +43,7 @@ from pharmacy.utils import get_processing_status
 from core.utils import upload_file, get_sql_alchemy_conn
 import uuid
 import re
-from .models import Pharmacy, ProcessLogDetail, FileType
+from .models import ProcessLogDetail, FileType
 from dateutil import parser
 from django.http import JsonResponse, HttpResponse
 from wsgiref.util import FileWrapper
@@ -53,6 +56,7 @@ from django.core.files.storage import FileSystemStorage
 from django.core.files.base import ContentFile
 import io
 from botocore.exceptions import ClientError
+from django.db import transaction
 
 
 class ProcessAuditData:
@@ -63,22 +67,38 @@ class ProcessAuditData:
         try:
             self.file_name = f"{self.process_log.name}.xlsx"
             self.full_file_name = os.path.join(
-                os.getcwd(), settings.AUDIT_FILES_LOCATION, self.file_name
+                os.getcwd(), settings.AUDIT_FILES_LOCATION, self.process_log.name, self.file_name
             )
+            # Ensure process folder exists
+            os.makedirs(os.path.dirname(self.full_file_name), exist_ok=True)
             self.writer = pd.ExcelWriter(self.full_file_name, engine="xlsxwriter")
             pd.DataFrame().to_excel(self.writer, sheet_name="output")
             file_location = ""
-            print("DEBUG: Entered process_log_details for process:", obj.id)
-            details = ProcessLogDetail.objects.filter(process_log=obj.id)
-            print("DEBUG: Found", details.count(), "detail records")
-            for process_dtl in ProcessLogDetail.objects.filter(
-                process_log=obj.id
-            ).all():
+
+            # Optimize query with select_related
+            details = ProcessLogDetail.objects.filter(process_log=obj.id).select_related(
+                'file_type', 'pharmacy', 'distributor'
+            )
+            logger.info(f"Processing {details.count()} detail records for process {obj.id}")
+
+            for process_dtl in details:
+                # Skip placeholder records with empty file_url
+                if not process_dtl.file_url or not process_dtl.file_url.strip():
+                    logger.warning(f"Skipping ProcessLogDetail with empty file_url: {process_dtl.file_name}")
+                    continue
+
+                # Skip records without file_type
+                if not process_dtl.file_type:
+                    logger.warning(f"Skipping ProcessLogDetail without file_type: {process_dtl.file_name}")
+                    continue
+
                 file_location = os.path.join(
                     os.getcwd(),
                     settings.AUDIT_FILES_LOCATION,
+                    self.process_log.name,
                     process_dtl.file_name,
                 )
+                logger.info(f"📥 Downloading to: {file_location}")
                 download_file(file_location, process_dtl.file_url)
                 if process_dtl.file_type.code == FileTypes.Pharmacy.value:
                     self.process_pharmacy_audit_file(
@@ -89,6 +109,7 @@ class ProcessAuditData:
                         file_location, process_dtl.distributor, self.writer
                     )
         except Exception as e:
+            logger.error(f"Exception in process_log_details for file {os.path.basename(file_location) if file_location else 'unknown'}: {e}", exc_info=True)
             if "invalid input syntax" in str(e).lower():
                 # primary_message = e.diag.message_primary
                 log_error(
@@ -101,7 +122,7 @@ class ProcessAuditData:
             else:
                 log_error(
                     process_log=self.process_log,
-                    error_message=f"An error occurred in generating the Report in  {os.path.basename(file_location)}",
+                    error_message=f"An error occurred in generating the Report in  {os.path.basename(file_location)}. Exception: {str(e)}",
                     error_type="Generating report error ",
                     error_severity_code="ER",
                     error_location="trigger_process",
@@ -128,8 +149,10 @@ class ProcessAuditData:
             obj.save()
 
     def clean_data_for_process_log(self):
-        PharmacyAuditData.objects.filter(process_log=self.process_log.id).delete()
-        DistributorAuditData.objects.filter(process_log=self.process_log.id).delete()
+        # Bulk delete for better performance
+        with transaction.atomic():
+            PharmacyAuditData.objects.filter(process_log=self.process_log.id).delete()
+            DistributorAuditData.objects.filter(process_log=self.process_log.id).delete()
 
     def calculate_total_diff(self, x):
         distributor_total = x.sum(axis=1)
@@ -289,8 +312,9 @@ class ProcessAuditData:
         table = table.groupby(level=0, group_keys=False).apply(
             self.calculate_total_diff
         )
-        table = table.style.map(self.highlight, subset=["Difference"])
-        table.to_excel(writer, sheet_name=sheet_name)
+        if not table.empty:
+            table = table.style.map(self.highlight, subset=["Difference"])
+            table.to_excel(writer, sheet_name=sheet_name)
 
     def get_bin_raw_data(self, bin_raw_df, writer):
         bin_groups = bin_raw_df["bgp_name"].unique()
@@ -304,14 +328,20 @@ class ProcessAuditData:
             df = df.fillna(0)
             df.to_excel(writer, sheet_name=f"{bin_group}_raw_data", index=False)
 
+    @lru_cache(maxsize=32)
+    def _get_col_mapping_cached(self, pharmacy_software_id):
+        """Cached column mapping to avoid repeated DB queries"""
+        return self.record_to_source_dest_map(
+            FileDBMapping.objects.filter(
+                pharmacy_software_id=pharmacy_software_id
+            ).values("source_col_name", "dest_col_name")
+        )
+
     def process_pharmacy_audit_file(self, file_location, pharmacy):
         try:
-            pharmacy_obj = Pharmacy.objects.get(id=pharmacy)
-            self.col_mapping = self.record_to_source_dest_map(
-                FileDBMapping.objects.filter(
-                    pharmacy_software=pharmacy_obj.software
-                ).values("source_col_name", "dest_col_name")
-            )
+            pharmacy_id = pharmacy.id if hasattr(pharmacy, 'id') else pharmacy
+            pharmacy_obj = Pharmacy.objects.select_related('software').get(id=pharmacy_id)
+            self.col_mapping = self._get_col_mapping_cached(pharmacy_obj.software.id)
             self.validate_headers(file_location, None, pharmacy)
             pharmacy_file = self.read_file(file_location)
             pharmacy_file = pharmacy_file.rename(columns=self.col_mapping)
@@ -355,15 +385,20 @@ class ProcessAuditData:
             pharmacy_file["created_at"] = datetime.now(tz=pytz.UTC)
             pharmacy_file["updated_at"] = datetime.now(tz=pytz.UTC)
             pharmacy_file["id"] = pharmacy_file.apply(lambda _: uuid.uuid4(), axis=1)
+
+            # Use larger chunk size for better performance with big files
+            chunk_size = 20000
             pharmacy_file.to_sql(
                 "OPT_PAD_PharmacyAuditData",
                 get_sql_alchemy_conn(),
                 if_exists="append",
                 index=False,
-                chunksize=10000,
+                chunksize=chunk_size,
+                method='multi'  # Use multi-row INSERT for better performance
             )
         finally:
-            os.remove(file_location)
+            if os.path.exists(file_location):
+                os.remove(file_location)
 
     def write_file_to_output(self, file_location, writer, distributor_name):
         name, extension = os.path.splitext(file_location)
@@ -434,15 +469,19 @@ class ProcessAuditData:
                 lambda _: uuid.uuid4(), axis=1
             )
 
+            # Use larger chunk size for better performance with big files
+            chunk_size = 20000
             distributor_file.to_sql(
                 "OPT_DAD_DistributorAuditData",
                 get_sql_alchemy_conn(),
                 if_exists="append",
                 index=False,
-                chunksize=10000,
+                chunksize=chunk_size,
+                method='multi'  # Use multi-row INSERT for better performance
             )
         finally:
-            os.remove(file_location)
+            if os.path.exists(file_location):
+                os.remove(file_location)
 
     def record_to_source_dest_map(self, mapping_data):
         return {
@@ -498,9 +537,9 @@ class ProcessAuditData:
 
     def read_xl_sheet(self, file_location):
         try:
-            xls = pd.ExcelFile(file_location)
+            xls = pd.ExcelFile(file_location, engine='openpyxl')
             if len(xls.sheet_names) > 0:
-                data_frame = pd.read_excel(xls, xls.sheet_names[0])
+                data_frame = pd.read_excel(xls, xls.sheet_names[0], engine='openpyxl')
                 header_row = self.find_header_row(data_frame)
                 end_row = self.find_end_row(data_frame, header_row)
                 if header_row > 0:
@@ -510,6 +549,8 @@ class ProcessAuditData:
                         header=header_row,
                         usecols=self.col_mapping.keys(),
                         nrows=end_row,
+                        engine='openpyxl',
+                        dtype=str  # Read as strings to avoid type inference overhead
                     )
                 else:
                     data_frame = pd.read_excel(
@@ -517,6 +558,8 @@ class ProcessAuditData:
                         xls.sheet_names[0],
                         usecols=self.col_mapping.keys(),
                         nrows=end_row,
+                        engine='openpyxl',
+                        dtype=str  # Read as strings to avoid type inference overhead
                     )
 
                 data_frame = data_frame.replace("#MULTIVALUE", None)
@@ -567,7 +610,9 @@ class ProcessAuditData:
                 )
             )
         elif pharmacy:
-            pharmacy_obj = Pharmacy.objects.get(id=pharmacy)
+            # Always use pharmacy.id if it's an object, otherwise treat as UUID
+            pharmacy_id = pharmacy.id if hasattr(pharmacy, 'id') else pharmacy
+            pharmacy_obj = Pharmacy.objects.get(id=pharmacy_id)
             self.col_mapping = self.record_to_source_dest_map(
                 FileDBMapping.objects.filter(
                     pharmacy_software=pharmacy_obj.software
@@ -1133,15 +1178,19 @@ def handle_zip_file(file, process_log, obj, pharmacy, is_resubmission=False, pro
     All files uploaded to S3, local disk is temporary workspace only.
     """
     import shutil
+    logger.info(f"[STEP 1] Entering handle_zip_file for process_log_id={process_log.id}, is_resubmission={is_resubmission}")
+
     # Use process_folder if provided, otherwise fall back to process name
     if process_folder is None:
         process_folder = os.path.join(settings.AUDIT_FILES_LOCATION, process_log.name)
         os.makedirs(os.path.join(os.getcwd(), process_folder), exist_ok=True)
 
+    logger.info(f"[STEP 2] Creating temp directories at temp_files/process_{process_log.id}")
     temp_dir = os.path.join(os.getcwd(), "temp_files", f"process_{process_log.id}")
     extract_to_folder = os.path.join(temp_dir, "extracted")
     remove_dir_recursive(temp_dir)
     os.makedirs(extract_to_folder, exist_ok=True)
+    logger.info(f"[STEP 3] Temp directories created successfully")
 
     created_files = []
     failed_files = []
@@ -1159,46 +1208,9 @@ def handle_zip_file(file, process_log, obj, pharmacy, is_resubmission=False, pro
 
             ErrorLogs.objects.filter(process_log=process_log).delete()
 
-            failed_list = []
-            if process_log.failed_files_json and process_log.failed_files_json != "[]":
-                try:
-                    failed_list = json.loads(process_log.failed_files_json)
-                except Exception:
-                    failed_list = []
-
-            #  Delete old failed files from S3 during reprocess
-            s3_client = get_boto3_client()
-            audit_dir = os.path.join(os.getcwd(), process_folder)
-            
-            for failed_name in failed_list:
-                possible_names = [failed_name, f"cleaned_{failed_name}"]
-                
-                # Delete DB entries
-                ProcessLogDetail.objects.filter(
-                    process_log=process_log, file_name__in=possible_names
-                ).delete()
-
-                # Delete from S3 FIRST
-                for name in possible_names:
-                    s3_key = f"{process_log.name}/{name}"
-                    try:
-                        s3_client.delete_object(Bucket=settings.AWS_BUCKET, Key=s3_key)
-                        print(f"🗑️ Deleted from S3: {s3_key}")
-                    except Exception as e:
-                        print(f" Could not delete from S3 {s3_key}: {e}")
-
-                # Delete local files
-                for name in possible_names:
-                    fpath = os.path.join(audit_dir, name)
-                    if os.path.exists(fpath):
-                        try:
-                            os.remove(fpath)
-                            print(f"🧹 Removed previously failed file: {name}")
-                        except Exception as e:
-                            print(f" Could not remove failed file {name}: {e}")
-
-            pharmacy_processed = process_log.pharmacy_processed_count or 0
-            distributor_processed = process_log.distributor_processed_count or 0
+            # Reset counters for resubmission
+            pharmacy_processed = 0
+            distributor_processed = 0
         else:
             process_log.failed_files_json = "[]"
             process_log.failed_count = 0
@@ -1209,6 +1221,7 @@ def handle_zip_file(file, process_log, obj, pharmacy, is_resubmission=False, pro
             process_log.save()
 
         # Save uploaded ZIP
+        logger.info(f"[STEP 4] Saving uploaded ZIP file to temp directory")
         temp_zip_path = os.path.join(temp_dir, "temp.zip")
         if isinstance(file, io.BytesIO):
             with open(temp_zip_path, "wb") as temp_zip_file:
@@ -1219,17 +1232,25 @@ def handle_zip_file(file, process_log, obj, pharmacy, is_resubmission=False, pro
                 content = f.read()
                 fs.save(file.name, ContentFile(content))
             temp_zip_path = os.path.join(temp_dir, file.name)
+        logger.info(f"[STEP 5] ZIP file saved at {temp_zip_path}")
 
         # Extract files
+        logger.info(f"[STEP 6] Extracting ZIP files to {extract_to_folder}")
         extracted_files = unzip_files(temp_zip_path, extract_to_folder, process_log)
+        logger.info(f"[STEP 7] Extracted {len(extracted_files)} files")
 
         if not is_resubmission:
+            logger.info(f"[STEP 8] Validating required files")
             validate_required_files(extracted_files, process_log)
+            logger.info(f"[STEP 9] Validation complete")
 
         entries = os.listdir(extract_to_folder)
+        logger.info(f"[STEP 10] Found {len(entries)} entries in extracted folder")
 
         # Clean & register files
-        for extracted_file in extracted_files:
+        logger.info(f"[STEP 11] Starting file cleaning loop for {len(extracted_files)} files")
+        for idx, extracted_file in enumerate(extracted_files):
+            logger.info(f"[STEP 11.{idx+1}] Processing file: {extracted_file}")
             if len(entries) == 1 and os.path.isdir(os.path.join(extract_to_folder, entries[0])):
                 folder_name = entries[0]
                 base_name = os.path.join(extract_to_folder, folder_name, extracted_file)
@@ -1237,14 +1258,16 @@ def handle_zip_file(file, process_log, obj, pharmacy, is_resubmission=False, pro
                 base_name = os.path.join(extract_to_folder, extracted_file)
 
             original_name = os.path.basename(base_name)
-            output_file = os.path.join(os.getcwd(), process_folder, f"cleaned_{original_name}")   
+            output_file = os.path.join(os.getcwd(), process_folder, f"cleaned_{original_name}")
             created_files.append(output_file)
 
             is_pharmacy_file = "pharmacy" in original_name.lower()
             is_distributor_file = "distributor" in original_name.lower()
 
             try:
+                logger.info(f"[STEP 11.{idx+1}a] Cleaning file: {original_name}")
                 clean_file_and_retreive_output_file(base_name, output_file)
+                logger.info(f"[STEP 11.{idx+1}b] File cleaned successfully: {original_name}")
             except Exception as e:
                 failed_files.append(original_name)
                 if is_pharmacy_file:
@@ -1264,15 +1287,18 @@ def handle_zip_file(file, process_log, obj, pharmacy, is_resubmission=False, pro
 
             file_name = os.path.basename(output_file)
             name, ext = os.path.splitext(file_name)
-            
+
+            logger.info(f"[STEP 11.{idx+1}c] Extracting columns from {file_name}")
             if ext.lower() in {".xlsx", ".xls", ".csv"}:
                 columns = extract_column_names(output_file)
-                
+                logger.info(f"[STEP 11.{idx+1}d] Found {len(columns)} columns")
+
                 # S3-FIRST: Use full S3 path for file_url
                 full_file_url = f"{settings.AWS_BUCKET}/{process_log.name}/{file_name}"
 
                 # DISTRIBUTOR FILE
                 if is_distributor_file:
+                    logger.info(f"[STEP 11.{idx+1}e] Processing as distributor file")
                     distributor_name = name.replace("cleaned_", "").split("-")[1]
                     if Distributors.objects.filter(description__icontains=distributor_name).exists():
                         distributor = Distributors.objects.filter(
@@ -1310,13 +1336,16 @@ def handle_zip_file(file, process_log, obj, pharmacy, is_resubmission=False, pro
 
                 # PHARMACY FILE
                 elif is_pharmacy_file:
+                    logger.info(f"[STEP 11.{idx+1}f] Processing as pharmacy file")
                     pharmacy_name = name.replace("cleaned_", "").split("-")[1]
                     if PharmacySoftware.objects.filter(description__icontains=pharmacy_name).exists():
                         software = PharmacySoftware.objects.filter(
                             description__icontains=pharmacy_name
                         ).first().id
-                        
+
+                        logger.info(f"[STEP 11.{idx+1}g] Checking pharmacy column mappings")
                         if check_Phamacy_column_mappings(extracted_file, software, columns, process_log):
+                            logger.info(f"[STEP 11.{idx+1}h] Creating ProcessLogDetail record")
                             ProcessLogDetail.objects.filter(
                                 process_log=process_log, file_name=file_name
                             ).delete()
@@ -1325,15 +1354,17 @@ def handle_zip_file(file, process_log, obj, pharmacy, is_resubmission=False, pro
                                 file_name=file_name,
                                 process_log=process_log,
                                 file_url=full_file_url,  # Full S3 path
-                                pharmacy=get_object_or_none(
-                                    Pharmacy, pk=get_default_value_if_null(pharmacy, None)
-                                ),
+                                pharmacy=pharmacy,
                             )
+                            logger.info(f"[STEP 11.{idx+1}i] Validating pharmacy headers and file")
                             process_audit_data = ProcessAuditData()
+                            logger.info(f"Before validate_headers: pharmacy type={type(pharmacy)}, value={pharmacy}, id={pharmacy.id if hasattr(pharmacy, 'id') else 'N/A'}")
                             process_audit_data.validate_headers(output_file, False, pharmacy)
+                            logger.info(f"[STEP 11.{idx+1}j] Validating file data")
                             is_valid_file, invalid_ndcs = process_audit_data.validate_file(
                                 output_file, False, pharmacy
                             )
+                            logger.info(f"[STEP 11.{idx+1}k] Validation complete, is_valid={is_valid_file}")
                             if not is_valid_file:
                                 failed_files.append(original_name)
                                 pharmacy_failed += 1
@@ -1350,10 +1381,10 @@ def handle_zip_file(file, process_log, obj, pharmacy, is_resubmission=False, pro
                             failed_files.append(original_name)
                             pharmacy_failed += 1
 
-        # Upload ALL files to S3 FIRST (successful + failed for forensics)
+        # Upload ALL files to S3 (successful + failed)
         upload_process_folder_to_s3(process_log.name)
-        
-        # THEN clean failed files from local audit folder (after S3 upload)
+
+        # Delete failed files from local folder (already in S3)
         audit_dir = os.path.join(os.getcwd(), process_folder)
         for failed in failed_files:
             possible_names = [failed, f"cleaned_{failed}"]
@@ -1362,22 +1393,24 @@ def handle_zip_file(file, process_log, obj, pharmacy, is_resubmission=False, pro
                 if os.path.exists(fpath):
                     try:
                         os.remove(fpath)
-                        print(f"🧹 Removed failed file from local audit folder: {fpath}")
+                        print(f"🗑️ Deleted failed file from local: {name}")
                     except Exception as e:
-                        print(f" Could not remove failed file {fpath}: {e}")
+                        print(f"⚠️ Could not delete failed file {name}: {e}")
 
         # Trigger final report
         process_audit_data = ProcessAuditData()
         error_severity = ErrorSeverity.objects.get(code="WA").id
         
-        # Don't set status here - trigger_process handles it
+        # Trigger report generation
         if not ErrorLogs.objects.filter(process_log=process_log).exclude(
             error_severity=error_severity
         ).exists():
             # trigger_process sets status to Success in generate_output_report()
             process_audit_data.trigger_process(obj)
+            # Reload to get the status saved by trigger_process
+            process_log.refresh_from_db()
         else:
-            # Only set failure status if there are errors
+            # Set failure status if there are errors
             process_log.status = get_processing_status(ProcessingStatusCodes.Failure.value)
 
         # Update counts
@@ -1387,27 +1420,21 @@ def handle_zip_file(file, process_log, obj, pharmacy, is_resubmission=False, pro
         process_log.pharmacy_failed_count = pharmacy_failed
         process_log.distributor_processed_count = distributor_processed
         process_log.distributor_failed_count = distributor_failed
-        
-        # Save (status already handled by trigger_process if successful)
-        update_fields = [
-            "pharmacy_processed_count", 
+
+        # Save all fields including status
+        process_log.save(update_fields=[
+            "status",
+            "pharmacy_processed_count",
             "pharmacy_failed_count",
             "distributor_processed_count",
             "distributor_failed_count",
-            "failed_count", 
+            "failed_count",
             "failed_files_json"
-        ]
-        
-        # Only include status if there were errors
-        if ErrorLogs.objects.filter(process_log=process_log).exclude(
-            error_severity=error_severity
-        ).exists():
-            update_fields.append("status")
-        
-        process_log.save(update_fields=update_fields)
+        ])
 
-        # Clean up local files after S3 upload
-        cleanup_local_process_folder(process_log.name)
+        # Clean up local files ONLY if no failures (keep successful files for resubmission)
+        if len(failed_files) == 0:
+            cleanup_local_process_folder(process_log.name)
 
     except Exception as e:
         process_log.status = get_processing_status(ProcessingStatusCodes.Failure.value)
@@ -1580,10 +1607,9 @@ def log_error(
 def extract_column_names(file_path, sheet_name=0):
     file_extension = os.path.splitext(file_path)[1].lower()
     if file_extension == ".csv":
-        df = pd.read_csv(file_path)
+        df = pd.read_csv(file_path, nrows=0)  # Only read headers
     elif file_extension in {".xls", ".xlsx"}:
-        df = pd.read_excel(file_path, sheet_name=sheet_name)
-    # df = pd.read_excel(file_path, sheet_name=sheet_name)
+        df = pd.read_excel(file_path, sheet_name=sheet_name, nrows=0, engine='openpyxl')  # Only read headers
     column_names = list(df.columns)
 
     return column_names
@@ -1755,27 +1781,44 @@ def upload_process_folder_to_s3(process_name):
     uploaded_count = 0
     skipped_count = 0
 
+    # Collect all files to upload
+    files_to_upload = []
     for root, dirs, files in os.walk(local_folder):
         for file_name in files:
             local_file_path = os.path.join(root, file_name)
             s3_key = f"{process_name}/{file_name}"
-            
+            files_to_upload.append((local_file_path, s3_key, file_name))
+
+    # Upload files in parallel using ThreadPoolExecutor
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def upload_single_file(local_path, s3_key, file_name):
+        try:
             # Check if file already exists in S3
+            s3_client.head_object(Bucket=settings.AWS_BUCKET, Key=s3_key)
+            return ('skipped', file_name)
+        except ClientError:
+            # File doesn't exist, upload it
             try:
-                s3_client.head_object(Bucket=settings.AWS_BUCKET, Key=s3_key)
-                print(f"⏭️ Skipping {file_name} (already in S3)")
-                skipped_count += 1
-                continue
-            except ClientError:
-                pass
-            
-            # Upload file to S3
-            try:
-                s3_client.upload_file(local_file_path, settings.AWS_BUCKET, s3_key)
-                print(f"✅ Uploaded {file_name} to S3")
-                uploaded_count += 1
+                s3_client.upload_file(local_path, settings.AWS_BUCKET, s3_key)
+                return ('uploaded', file_name)
             except Exception as e:
-                print(f"❌ Failed to upload {file_name}: {e}")
+                return ('failed', file_name, str(e))
+
+    # Use ThreadPoolExecutor for parallel uploads (max 4 concurrent uploads)
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {executor.submit(upload_single_file, *file_info): file_info for file_info in files_to_upload}
+
+        for future in as_completed(futures):
+            result = future.result()
+            if result[0] == 'uploaded':
+                print(f"✅ Uploaded {result[1]} to S3")
+                uploaded_count += 1
+            elif result[0] == 'skipped':
+                print(f"⏭️ Skipping {result[1]} (already in S3)")
+                skipped_count += 1
+            else:  # failed
+                print(f"❌ Failed to upload {result[1]}: {result[2]}")
 
     print(f" Upload complete: {uploaded_count} uploaded, {skipped_count} skipped")
     

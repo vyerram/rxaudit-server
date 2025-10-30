@@ -208,6 +208,12 @@ def upload_file(file_path, file_url=None):
 def download_file(file_path, file_url=None):
     if os.path.exists(file_path):
         return
+
+    # Create parent directory if it doesn't exist
+    parent_dir = os.path.dirname(file_path)
+    if parent_dir:
+        os.makedirs(parent_dir, exist_ok=True)
+
     s3_client = get_boto3_client()
     object_name = (
         file_url.replace(f"{settings.AWS_BUCKET}/", "")
