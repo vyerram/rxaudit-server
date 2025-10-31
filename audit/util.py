@@ -278,19 +278,44 @@ class ProcessAuditData:
             table.to_excel(writer, sheet_name=bin_group)
 
     def generate_compared_report(self, df, writer, sheet_name):
+        # DEBUG: Print raw data before pivot for NDC 00115-1694-49
+        debug_ndc = df[df["NDC"].astype(str).str.contains("115169449", na=False)]
+        if not debug_ndc.empty:
+            print("\n=== DEBUG: Raw data for NDC 00115169449 BEFORE pivot ===")
+            print(debug_ndc[["NDC", "description", "distributor_quantity"]].to_string())
+            print(f"Unique distributors: {debug_ndc['description'].unique()}")
+            print(f"Total Kinray qty: {debug_ndc[debug_ndc['description']=='Kinray']['distributor_quantity'].sum()}")
+            print(f"Total Trxade qty: {debug_ndc[debug_ndc['description']=='Trxade']['distributor_quantity'].sum()}")
+
         df["NDC"] = df["NDC"].astype(str).apply(lambda x: self.format_NDC(x))
         df = df.fillna(0)
+
+        # Aggregate pharmacy quantities by NDC before pivoting to avoid duplicate rows
+        # Group by identifying fields and sum the quantities
+        df_agg = df.groupby(
+            ["NDC", "Brand", "Drug Name", "Strength", "Pack", "description"],
+            as_index=False
+        ).agg({
+            "Dispense Qty in Packs": "sum",
+            "Dispense Qty in Units": "sum",
+            "Total Insurance paid": "sum",
+            "Patient Co-pay": "sum",
+            "No of RX": "sum",
+            "distributor_quantity": "sum"
+        })
+
+        # Now pivot on the aggregated data
         table = pd.pivot_table(
-            df,
+            df_agg,
             values="distributor_quantity",
             index=[
                 "NDC",
                 "Brand",
                 "Drug Name",
                 "Strength",
+                "Pack",
                 "Dispense Qty in Packs",
                 "Dispense Qty in Units",
-                "Pack",
                 "Total Insurance paid",
                 "Patient Co-pay",
                 "No of RX",
@@ -308,10 +333,39 @@ class ProcessAuditData:
     
         if 0 in table.columns:
             table = table.drop(0, axis=1)
+            print("DEBUG: Dropped column 0")
+
+        print(f"DEBUG: Columns after dropping 0: {table.columns.tolist()}")
+
+        # DEBUG: Check specific NDC before fillna
+        if any('00115169449' in str(idx) for idx in table.index):
+            print("\n=== DEBUG: NDC 00115-1694-49 AFTER pivot, BEFORE fillna ===")
+            for idx in table.index:
+                if '00115169449' in str(idx):
+                    print(f"Row: {table.loc[idx].to_dict()}")
+                    break
+
         table = table.fillna(0)
+
+        # DEBUG: Check after fillna
+        if any('00115169449' in str(idx) for idx in table.index):
+            print("\n=== DEBUG: NDC 00115-1694-49 AFTER fillna, BEFORE calculate_total_diff ===")
+            for idx in table.index:
+                if '00115169449' in str(idx):
+                    print(f"Row: {table.loc[idx].to_dict()}")
+                    break
+
         table = table.groupby(level=0, group_keys=False).apply(
             self.calculate_total_diff
         )
+
+        # DEBUG: Check after calculate_total_diff
+        if any('00115169449' in str(idx) for idx in table.index):
+            print("\n=== DEBUG: NDC 00115-1694-49 AFTER calculate_total_diff ===")
+            for idx in table.index:
+                if '00115169449' in str(idx):
+                    print(f"Row: {table.loc[idx].to_dict()}")
+                    break
         if not table.empty:
             table = table.style.map(self.highlight, subset=["Difference"])
             table.to_excel(writer, sheet_name=sheet_name)
@@ -1300,10 +1354,15 @@ def handle_zip_file(file, process_log, obj, pharmacy, is_resubmission=False, pro
                 if is_distributor_file:
                     logger.info(f"[STEP 11.{idx+1}e] Processing as distributor file")
                     distributor_name = name.replace("cleaned_", "").split("-")[1]
-                    if Distributors.objects.filter(description__icontains=distributor_name).exists():
-                        distributor = Distributors.objects.filter(
-                            description__icontains=distributor_name
-                        ).first().id
+                    logger.info(f"[STEP 11.{idx+1}e1] Extracted distributor name from filename: '{distributor_name}'")
+
+                    # Use iexact for exact match (case-insensitive) instead of icontains
+                    if Distributors.objects.filter(description__iexact=distributor_name).exists():
+                        distributor_obj = Distributors.objects.filter(
+                            description__iexact=distributor_name
+                        ).first()
+                        distributor = distributor_obj.id
+                        logger.info(f"[STEP 11.{idx+1}e2] Matched distributor: ID={distributor}, Description='{distributor_obj.description}'")
                         
                         if check_column_mappings(extracted_file, distributor, columns, process_log):
                             ProcessLogDetail.objects.filter(

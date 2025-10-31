@@ -984,6 +984,284 @@ class ProcessLogHdrviewset(CoreViewset):
         except Exception as e:
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
+    @action(detail=True, methods=[HTTPMethod.POST])
+    def generate_report(self, request, pk):
+        """
+        Generate custom report data with date filters for the reports page.
+        Returns JSON data matching the Excel output format.
+        """
+        try:
+            from .constants import get_output_report_sql
+            from core.utils import get_sql_alchemy_conn
+            import pandas as pd
+
+            obj = self.get_object()
+
+            # Extract filter parameters
+            pharmacy_from_date = request.data.get('pharmacy_from_date')
+            pharmacy_to_date = request.data.get('pharmacy_to_date')
+            distributor_from_date = request.data.get('distributor_from_date')
+            distributor_to_date = request.data.get('distributor_to_date')
+            group = request.data.get('group')
+            pcn = request.data.get('pcn')
+            bin_number = request.data.get('bin_number')
+
+            # Get the SQL query
+            sql_query = get_output_report_sql(
+                process_log_id=obj.id,
+                pharmacy_from_date=pharmacy_from_date,
+                pharmacy_to_date=pharmacy_to_date,
+                distributor_from_date=distributor_from_date,
+                distributor_to_date=distributor_to_date,
+                group=group,
+                pcn=pcn,
+                bin_number=bin_number
+            )
+
+            # Execute query and get DataFrame
+            df = pd.read_sql_query(sql_query, con=get_sql_alchemy_conn())
+
+            if df.empty:
+                return Response({
+                    'report_data': [],
+                    'count': 0,
+                    'distributor_columns': [],
+                    'filters_applied': {
+                        'pharmacy_from_date': pharmacy_from_date,
+                        'pharmacy_to_date': pharmacy_to_date,
+                        'distributor_from_date': distributor_from_date,
+                        'distributor_to_date': distributor_to_date,
+                    }
+                }, status=status.HTTP_200_OK)
+
+            # Format NDC
+            def format_ndc(x):
+                if x and str(x) != 'None':
+                    x = str(x)
+                    if len(x) < 11:
+                        x = "0" * (11 - len(x)) + x
+                    return x[:5] + "-" + x[5:9] + "-" + x[9:11]
+                return x
+
+            df["NDC"] = df["NDC"].astype(str).apply(format_ndc)
+            df = df.fillna(0)
+
+            # Aggregate by NDC to avoid duplicate rows (same logic as Excel generation)
+            df_agg = df.groupby(
+                ["NDC", "Brand", "Drug Name", "Strength", "Pack", "description"],
+                as_index=False
+            ).agg({
+                "Dispense Qty in Packs": "sum",
+                "Dispense Qty in Units": "sum",
+                "Total Insurance paid": "sum",
+                "Patient Co-pay": "sum",
+                "No of RX": "sum",
+                "distributor_quantity": "sum"
+            })
+
+            # Pivot to create distributor columns
+            pivot = pd.pivot_table(
+                df_agg,
+                values="distributor_quantity",
+                index=[
+                    "NDC", "Brand", "Drug Name", "Strength", "Pack",
+                    "Dispense Qty in Packs", "Dispense Qty in Units",
+                    "Total Insurance paid", "Patient Co-pay", "No of RX"
+                ],
+                columns=["description"],
+                aggfunc="sum",
+                fill_value=0
+            )
+
+            # Remove column "0" if it exists
+            if 0 in pivot.columns:
+                pivot = pivot.drop(0, axis=1)
+
+            # Reset index to make it a regular DataFrame
+            pivot = pivot.reset_index()
+
+            # Get distributor column names
+            distributor_columns = [col for col in pivot.columns if col not in [
+                "NDC", "Brand", "Drug Name", "Strength", "Pack",
+                "Dispense Qty in Packs", "Dispense Qty in Units",
+                "Total Insurance paid", "Patient Co-pay", "No of RX"
+            ]]
+
+            # Calculate Total and Difference
+            pivot["Total"] = pivot[distributor_columns].sum(axis=1)
+            pivot["Difference"] = pivot["Total"] - pivot["Dispense Qty in Units"]
+
+            # Convert to JSON format
+            report_data = []
+            for _, row in pivot.iterrows():
+                row_data = {
+                    'ndc': row['NDC'],
+                    'brand': row['Brand'],
+                    'drugName': row['Drug Name'],
+                    'strength': row['Strength'],
+                    'pack': row['Pack'],
+                    'dispenseQtyInPacks': float(row['Dispense Qty in Packs']),
+                    'dispenseQtyInUnits': float(row['Dispense Qty in Units']),
+                    'totalInsurancePaid': float(row['Total Insurance paid']),
+                    'patientCoPay': float(row['Patient Co-pay']),
+                    'noOfRx': int(row['No of RX']),
+                    'total': float(row['Total']),
+                    'difference': float(row['Difference']),
+                }
+
+                # Add distributor columns dynamically
+                for dist_col in distributor_columns:
+                    row_data[f'distributor_{dist_col}'] = float(row[dist_col])
+
+                report_data.append(row_data)
+
+            return Response({
+                'report_data': report_data,
+                'count': len(report_data),
+                'distributor_columns': distributor_columns,
+                'filters_applied': {
+                    'pharmacy_from_date': pharmacy_from_date,
+                    'pharmacy_to_date': pharmacy_to_date,
+                    'distributor_from_date': distributor_from_date,
+                    'distributor_to_date': distributor_to_date,
+                }
+            }, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            logger.error(f"generate_report error for pk={pk}: {str(e)}", exc_info=True)
+            return Response(
+                {"error": str(e), "message": "Failed to generate report"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+    @action(detail=True, methods=[HTTPMethod.POST])
+    def export_report(self, request, pk):
+        """
+        Export custom report to Excel with date filters.
+        Returns Excel file as binary data for download.
+        """
+        try:
+            from .constants import get_output_report_sql
+            from .util import get_sql_alchemy_conn
+            import os
+            from datetime import datetime
+            import tempfile
+
+            obj = self.get_object()
+
+            # Extract filter parameters from request (use originals if not provided)
+            pharmacy_from_date = request.data.get('pharmacy_from_date') or obj.pharmacy_from_date
+            pharmacy_to_date = request.data.get('pharmacy_to_date') or obj.pharmacy_to_date
+            distributor_from_date = request.data.get('distributor_from_date') or obj.distributor_from_date
+            distributor_to_date = request.data.get('distributor_to_date') or obj.distributor_to_date
+
+            # Get the data using SQL query
+            df = pd.read_sql_query(
+                get_output_report_sql(
+                    obj.id,
+                    pharmacy_from_date,
+                    pharmacy_to_date,
+                    distributor_from_date,
+                    distributor_to_date,
+                    obj.group,
+                    obj.pcn,
+                    obj.bin_number,
+                ),
+                con=get_sql_alchemy_conn(),
+            )
+
+            # Format NDC
+            def format_ndc(x):
+                if pd.notna(x):
+                    x = str(x)
+                    if len(x) < 11:
+                        x = "0" * (11 - len(x)) + x
+                    return x[:5] + "-" + x[5:9] + "-" + x[9:11]
+                return x
+
+            df["NDC"] = df["NDC"].astype(str).apply(format_ndc)
+            df = df.fillna(0)
+
+            # Aggregate to avoid duplicate rows
+            df_agg = df.groupby(
+                ["NDC", "Brand", "Drug Name", "Strength", "Pack", "description"],
+                as_index=False
+            ).agg({
+                "Dispense Qty in Packs": "sum",
+                "Dispense Qty in Units": "sum",
+                "Total Insurance paid": "sum",
+                "Patient Co-pay": "sum",
+                "No of RX": "sum",
+                "distributor_quantity": "sum"
+            })
+
+            # Pivot to create distributor columns
+            pivot = pd.pivot_table(
+                df_agg,
+                values="distributor_quantity",
+                index=[
+                    "NDC", "Brand", "Drug Name", "Strength", "Pack",
+                    "Dispense Qty in Packs", "Dispense Qty in Units",
+                    "Total Insurance paid", "Patient Co-pay", "No of RX"
+                ],
+                columns=["description"],
+                aggfunc="sum",
+                fill_value=0
+            )
+
+            # Remove column "0" if it exists
+            if 0 in pivot.columns:
+                pivot = pivot.drop(0, axis=1)
+
+            pivot = pivot.reset_index()
+
+            # Get distributor column names
+            distributor_columns = [col for col in pivot.columns if col not in [
+                "NDC", "Brand", "Drug Name", "Strength", "Pack",
+                "Dispense Qty in Packs", "Dispense Qty in Units",
+                "Total Insurance paid", "Patient Co-pay", "No of RX"
+            ]]
+
+            # Calculate Total and Difference
+            pivot["Total"] = pivot[distributor_columns].sum(axis=1)
+            pivot["Difference"] = pivot["Total"] - pivot["Dispense Qty in Units"]
+
+            # Create Excel file
+            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx')
+            temp_path = temp_file.name
+            temp_file.close()
+
+            # Write to Excel
+            with pd.ExcelWriter(temp_path, engine="xlsxwriter") as writer:
+                pivot.to_excel(writer, sheet_name="Comparison Report", index=False)
+
+            # Read the file
+            with open(temp_path, 'rb') as f:
+                file_data = f.read()
+
+            # Clean up temp file
+            os.remove(temp_path)
+
+            # Generate filename
+            date_str = datetime.now().strftime("%Y-%m-%d")
+            filename = f"Comparison_Report_{obj.name}_{date_str}.xlsx"
+
+            # Return as file download
+            response = HttpResponse(
+                file_data,
+                content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            )
+            response['Content-Disposition'] = f'attachment; filename="{filename}"'
+
+            return response
+
+        except Exception as e:
+            logger.error(f"export_report error for pk={pk}: {str(e)}", exc_info=True)
+            return Response(
+                {"error": str(e), "message": "Failed to export report"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
 
 class ProcessLogDetailviewset(CoreViewset):
     serializer_class = serializers.ProcessLogDetailserializer

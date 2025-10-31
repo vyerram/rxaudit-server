@@ -350,10 +350,7 @@ table_group = [
 ]
 
 role_data = [
-    {"name": "AllWinAdmin", "code": "AA"},
-    {"name": "AllWinUser", "code": "AU"},
     {"name": "SuperUser", "code": "SU"},
-    {"name": "AllWinSales", "code": "AS"},
     {"name": "PharmacyUser", "code": "PU"},
 ]
 

@@ -96,10 +96,10 @@ def get_output_report_sql(
         SUM(pharmacy_data."Total Insurance paid") AS "Total Insurance paid",
         SUM(pharmacy_data."Patient Co-pay") AS "Patient Co-pay",
         SUM(pharmacy_data."No of RX") AS "No of RX",
-        MAX(distributor_data.description) AS description,
+        distributor_data.description AS description,
         SUM(distributor_data.distributor_quantity) AS distributor_quantity
-    FROM 
-        (SELECT 
+    FROM
+        (SELECT
             pad_ndc AS "NDC",
             pad_brand AS "Brand",
             pad_strength AS "Strength",
@@ -110,41 +110,42 @@ def get_output_report_sql(
             SUM(pad_ins_paid) AS "Total Insurance paid",
             SUM(pad_patient_copay) AS "Patient Co-pay",
             COUNT(pad_ndc) AS "No of RX"
-        FROM 
+        FROM
             public."OPT_PAD_PharmacyAuditData"
-        WHERE 
-            pad_process_log_id = '{process_log_id}' 
-            {pharmacy_date_filter} 
-            {payment_option_filter} 
+        WHERE
+            pad_process_log_id = '{process_log_id}'
+            {pharmacy_date_filter}
+            {payment_option_filter}
             {claim_status_filter}
             {group_filter}
-            {pcn_filter} 
+            {pcn_filter}
             {bin_filter}
-        GROUP BY 
+        GROUP BY
             pad_ndc, pad_brand, pad_strength, pad_drug_name, pad_size
         ) AS pharmacy_data
-    FULL OUTER JOIN 
-        (SELECT 
-            dad_ndc, 
-            description, 
+    FULL OUTER JOIN
+        (SELECT
+            dad_ndc,
+            description,
             dad_drug_name,
             SUM(dad_quantity) AS distributor_quantity
-        FROM 
+        FROM
             "OPT_DAD_DistributorAuditData"
-        JOIN 
-            "OPT_DTB_Distributors" 
-        ON 
+        JOIN
+            "OPT_DTB_Distributors"
+        ON
             "OPT_DTB_Distributors".id = dad_distributor
-        WHERE 
-            dad_process_log_id = '{process_log_id}' 
+        WHERE
+            dad_process_log_id = '{process_log_id}'
             {distributor_date_filter}
-        GROUP BY 
+        GROUP BY
             dad_ndc, description, dad_drug_name
         ) AS distributor_data
-    ON 
+    ON
         pharmacy_data."NDC" = distributor_data.dad_ndc
-    GROUP BY 
-        COALESCE(pharmacy_data."NDC", distributor_data.dad_ndc)
+    GROUP BY
+        COALESCE(pharmacy_data."NDC", distributor_data.dad_ndc),
+        distributor_data.description
 """
 
     return output_report_statement
